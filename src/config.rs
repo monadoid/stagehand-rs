@@ -140,6 +140,24 @@ impl ModelName {
             _ => None,
         }
     }
+
+    /// Return the canonical model name string used by API clients.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ModelName::Gpt4o => "gpt-4o",
+            ModelName::Gpt4oMini => "gpt-4o-mini",
+            ModelName::Claude35SonnetLatest => "claude-3-5-sonnet-latest",
+            ModelName::Claude37SonnetLatest => "claude-3-7-sonnet-latest",
+            ModelName::ComputerUsePreview => "computer-use-preview",
+            ModelName::Gemini20Flash => "gemini-2.0-flash",
+        }
+    }
+}
+
+impl fmt::Display for ModelName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 /// Configuration values for the Stagehand client.

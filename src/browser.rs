@@ -64,6 +64,7 @@ pub struct LocalBrowserConnection {
     pub downloads_path: PathBuf,
     pub cookies: Option<Vec<JsonValue>>,
     pub launch_options: LocalLaunchOptions,
+    pub chrome_executable: Option<PathBuf>,
 }
 
 /// Persistent context launch options loosely mirroring Playwright's API.
@@ -166,6 +167,7 @@ pub struct LocalPlan {
     pub launch_options: LocalLaunchOptions,
     pub downloads_path: PathBuf,
     pub cookies: Option<Vec<JsonValue>>,
+    pub chrome_executable: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -185,12 +187,18 @@ pub trait BrowserRuntime: Send + Sync {
     async fn connect_browserbase(&self, plan: &BrowserbasePlan) -> Result<(), BrowserRuntimeError>;
 
     async fn launch_local(&self, plan: &LocalPlan) -> Result<(), BrowserRuntimeError>;
+
+    async fn new_page(&self, url: &str) -> Result<String, BrowserRuntimeError>;
+
+    async fn page_content(&self, page_id: &str) -> Result<Option<String>, BrowserRuntimeError>;
 }
 
 #[derive(Debug, Error)]
 pub enum BrowserRuntimeError {
     #[error("browser runtime error: {0}")]
     Message(String),
+    #[error("browser runtime not initialized")]
+    NotInitialized,
 }
 
 /// High-level browser client that owns planning and runtime dispatch.
@@ -347,6 +355,9 @@ impl LocalBrowserConnection {
 
         let viewport = overrides.viewport.unwrap_or_default();
 
+        let chrome_executable =
+            string_from(map, &["chrome_executable", "chromeExecutable"]).map(PathBuf::from);
+
         let launch_options = LocalLaunchOptions {
             headless,
             accept_downloads,
@@ -366,6 +377,7 @@ impl LocalBrowserConnection {
             downloads_path,
             cookies,
             launch_options,
+            chrome_executable,
         })
     }
 }
@@ -388,6 +400,7 @@ impl LocalBrowserConnection {
             launch_options: self.launch_options.clone(),
             downloads_path: self.downloads_path.clone(),
             cookies: self.cookies.clone(),
+            chrome_executable: self.chrome_executable.clone(),
         }
     }
 }
@@ -453,6 +466,15 @@ fn merge_json_values(base: &mut JsonValue, overlay: &JsonValue) {
     }
 }
 
+fn string_from(map: &JsonObject, keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|key| {
+        map.get(*key).and_then(|value| match value {
+            JsonValue::String(val) => Some(val.to_string()),
+            _ => None,
+        })
+    })
+}
+
 impl<R: BrowserRuntime> StagehandBrowser<R> {
     pub fn new(config: StagehandConfig, runtime: R) -> Result<Self, BrowserError> {
         let manager = BrowserManager::new(config)?;
@@ -492,6 +514,7 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use serde_json::json;
+    use std::collections::HashMap;
     use std::path::Path;
     use std::sync::Mutex;
 
@@ -601,6 +624,8 @@ mod tests {
     struct RecordingRuntime {
         browserbase_calls: Mutex<usize>,
         local_calls: Mutex<usize>,
+        pages: Mutex<HashMap<String, String>>,
+        next_page: Mutex<u32>,
     }
 
     #[async_trait]
@@ -616,6 +641,21 @@ mod tests {
         async fn launch_local(&self, _plan: &LocalPlan) -> Result<(), BrowserRuntimeError> {
             *self.local_calls.lock().unwrap() += 1;
             Ok(())
+        }
+
+        async fn new_page(&self, url: &str) -> Result<String, BrowserRuntimeError> {
+            let mut next = self.next_page.lock().unwrap();
+            let id = format!("page-{}", *next);
+            *next += 1;
+            self.pages
+                .lock()
+                .unwrap()
+                .insert(id.clone(), format!("content:{url}"));
+            Ok(id)
+        }
+
+        async fn page_content(&self, page_id: &str) -> Result<Option<String>, BrowserRuntimeError> {
+            Ok(self.pages.lock().unwrap().get(page_id).cloned())
         }
     }
 

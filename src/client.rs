@@ -137,6 +137,19 @@ impl<R: BrowserRuntime> StagehandClient<R> {
         })
         .await
     }
+
+    /// Open a new page using the underlying browser runtime and ensure it is registered.
+    pub async fn open_page(&self, url: &str) -> Result<String, StagehandClientError> {
+        self.ensure_initialized().await?;
+        let page_id = self.browser.runtime().new_page(url).await?;
+        self.ensure_page_ready(page_id.clone(), None).await?;
+        self.with_context(|ctx| {
+            ctx.set_active_page(&page_id)?;
+            Ok(())
+        })
+        .await?;
+        Ok(page_id)
+    }
 }
 
 #[cfg(test)]
@@ -146,12 +159,15 @@ mod tests {
     use crate::config::{Environment, StagehandConfig};
     use crate::context::{StagehandAdapter, StagehandAdapterError};
     use async_trait::async_trait;
+    use std::collections::HashMap;
     use std::sync::Mutex;
 
     #[derive(Default)]
     struct RecordingRuntime {
         browserbase_calls: Mutex<usize>,
         local_calls: Mutex<usize>,
+        pages: Mutex<HashMap<String, String>>,
+        next_page: Mutex<u32>,
     }
 
     #[async_trait]
@@ -168,6 +184,21 @@ mod tests {
             *self.local_calls.lock().unwrap() += 1;
             Ok(())
         }
+
+        async fn new_page(&self, url: &str) -> Result<String, BrowserRuntimeError> {
+            let mut next = self.next_page.lock().unwrap();
+            let id = format!("page-{}", *next);
+            *next += 1;
+            self.pages
+                .lock()
+                .unwrap()
+                .insert(id.clone(), format!("content:{url}"));
+            Ok(id)
+        }
+
+        async fn page_content(&self, page_id: &str) -> Result<Option<String>, BrowserRuntimeError> {
+            Ok(self.pages.lock().unwrap().get(page_id).cloned())
+        }
     }
 
     #[derive(Default)]
@@ -175,6 +206,7 @@ mod tests {
         inject_calls: Mutex<Vec<String>>,
         debug_logs: Mutex<Vec<String>>,
         error_logs: Mutex<Vec<String>>,
+        active_pages: Mutex<Vec<String>>,
     }
 
     impl StagehandAdapter for RecordingAdapter {
@@ -195,7 +227,9 @@ mod tests {
             self.error_logs.lock().unwrap().push(message.to_string());
         }
 
-        fn notify_active_page(&self, _page_id: &String) {}
+        fn notify_active_page(&self, page_id: &String) {
+            self.active_pages.lock().unwrap().push(page_id.clone());
+        }
     }
 
     #[tokio::test]
@@ -235,6 +269,30 @@ mod tests {
         client.ensure_page_ready("page-1", None).await.unwrap();
 
         assert_eq!(*client.browser().runtime().local_calls.lock().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn open_page_registers_and_returns_content() {
+        let mut config = StagehandConfig::default();
+        config.env = Environment::Local;
+        let runtime = RecordingRuntime::default();
+        let adapter = Arc::new(RecordingAdapter::default());
+        let client =
+            StagehandClient::new(config, runtime, adapter.clone(), "script").expect("client");
+
+        let page_id = client.open_page("https://example.com").await.unwrap();
+
+        assert!(adapter.inject_calls.lock().unwrap().contains(&page_id));
+        assert!(adapter.active_pages.lock().unwrap().contains(&page_id));
+
+        let content = client
+            .browser()
+            .runtime()
+            .page_content(&page_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(content, "content:https://example.com");
     }
 
     #[test]

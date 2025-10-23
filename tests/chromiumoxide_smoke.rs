@@ -1,13 +1,46 @@
 use std::env;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, anyhow};
-use chromiumoxide::{
-    browser::{Browser, BrowserConfig},
-    error::{CdpError, Result as OxideResult},
-};
-use futures_util::StreamExt;
 use log::info;
+use serde_json::Value;
+use stagehand_rs::browser::BrowserRuntime;
+use stagehand_rs::client::StagehandClient;
+use stagehand_rs::config::{Environment, StagehandConfig};
+use stagehand_rs::context::{StagehandAdapter, StagehandAdapterError};
+use stagehand_rs::runtime::ChromiumoxideRuntime;
+
+#[derive(Default)]
+struct TrackingAdapter {
+    injections: Mutex<Vec<String>>,
+    active: Mutex<Vec<String>>,
+    debug_logs: Mutex<Vec<String>>,
+    error_logs: Mutex<Vec<String>>,
+}
+
+impl StagehandAdapter for TrackingAdapter {
+    fn inject_dom_script(
+        &self,
+        page_id: &String,
+        _script: &str,
+    ) -> Result<(), StagehandAdapterError> {
+        self.injections.lock().unwrap().push(page_id.clone());
+        Ok(())
+    }
+
+    fn log_debug(&self, message: &str, _category: &'static str) {
+        self.debug_logs.lock().unwrap().push(message.to_string());
+    }
+
+    fn log_error(&self, message: &str, _category: &'static str) {
+        self.error_logs.lock().unwrap().push(message.to_string());
+    }
+
+    fn notify_active_page(&self, page_id: &String) {
+        self.active.lock().unwrap().push(page_id.clone());
+    }
+}
 
 #[tokio::test]
 async fn chromiumoxide_launches_and_executes_cdp() -> Result<()> {
@@ -29,69 +62,57 @@ async fn chromiumoxide_launches_and_executes_cdp() -> Result<()> {
         return Ok(());
     }
 
-    let config = BrowserConfig::builder()
-        .chrome_executable(&chrome_bin)
-        .build()
-        .map_err(|err| anyhow!("failed to build chromium config: {err}"))?;
+    let mut config = StagehandConfig::default();
+    config.env = Environment::Local;
+    config.headless = true;
+    config.local_browser_launch_options.insert(
+        "chromeExecutable".into(),
+        Value::String(chrome_bin.to_string_lossy().into()),
+    );
 
-    let (mut browser, mut handler) = Browser::launch(config)
+    let runtime = ChromiumoxideRuntime::new();
+    let adapter = Arc::new(TrackingAdapter::default());
+    let client = StagehandClient::new(
+        config,
+        runtime,
+        adapter.clone(),
+        "window.__stagehand_injected = true;",
+    )
+    .context("failed to construct stagehand client")?;
+
+    let page_id = client
+        .open_page("https://example.com")
         .await
-        .context("failed to launch chromium")?;
+        .context("failed to open page via stagehand client")?;
 
-    let handler_task: tokio::task::JoinHandle<OxideResult<()>> = tokio::spawn(async move {
-        while let Some(result) = handler.next().await {
-            match result {
-                Ok(_) => {}
-                Err(CdpError::ChannelSendError(_)) | Err(CdpError::NoResponse) => break,
-                Err(err) => return Err(err),
-            }
-        }
-        Ok(())
-    });
-
-    let page = browser
-        .new_page("https://example.com")
-        .await
-        .context("failed to open new page")?;
-
-    let page = page
-        .wait_for_navigation()
-        .await
-        .context("navigation to example.com failed")?;
-
-    let html = page
-        .content()
-        .await
-        .context("failed to fetch page content")?;
     assert!(
-        html.contains("Example Domain"),
+        adapter.injections.lock().unwrap().contains(&page_id),
+        "expected dom script injection for page"
+    );
+    assert!(
+        adapter.active.lock().unwrap().contains(&page_id),
+        "expected active page notification"
+    );
+
+    let content = client
+        .browser()
+        .runtime()
+        .page_content(&page_id)
+        .await
+        .context("runtime error fetching page content")?
+        .ok_or_else(|| anyhow!("runtime returned no content for page {page_id}"))?;
+
+    info!("Fetched page content ({} bytes)", content.len());
+    assert!(
+        content.contains("Example Domain"),
         "expected Example Domain in page content"
     );
-    info!("Fetched page content ({} bytes)", html.len());
-
-    let heading = page
-        .find_element("h1")
-        .await
-        .context("failed to find h1 element")?
-        .inner_text()
-        .await
-        .context("failed to read heading text")?
-        .unwrap_or_default();
-    assert_eq!(heading.trim(), "Example Domain");
-    info!("Heading text: {}", heading.trim());
-
-    browser
-        .close()
-        .await
-        .context("failed to close chromium instance")?;
-
-    match handler_task.await {
-        Ok(Ok(())) => {}
-        Ok(Err(err)) if matches!(err, CdpError::ChannelSendError(_) | CdpError::NoResponse) => {
-            info!("handler finished with benign error: {err:?}");
+    if let Some(start) = content.find("<h1>") {
+        if let Some(end) = content[start..].find("</h1>") {
+            let heading = &content[start + 4..start + end];
+            info!("Heading text: {}", heading.trim());
+            assert_eq!(heading.trim(), "Example Domain");
         }
-        Ok(Err(err)) => return Err(err.into()),
-        Err(join_err) => return Err(join_err.into()),
     }
 
     Ok(())
