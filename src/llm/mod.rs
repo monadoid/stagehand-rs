@@ -6,6 +6,7 @@
 pub mod client;
 pub mod error;
 pub mod openai;
+pub mod prompts;
 pub mod provider;
 
 pub use client::{ChatCompletionOptions, MetricsCallback, StagehandLlmClient};

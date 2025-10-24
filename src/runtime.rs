@@ -197,6 +197,36 @@ impl ChromiumoxideRuntime {
         }
     }
 
+    pub async fn page(&self, page_id: &str) -> Result<Option<ChromiumPage>, BrowserRuntimeError> {
+        let guard = self.state.lock().await;
+        let state = guard.as_ref().ok_or(BrowserRuntimeError::NotInitialized)?;
+        Ok(state.pages.get(page_id).cloned())
+    }
+
+    async fn populate_initial_pages(&self) -> Result<(), BrowserRuntimeError> {
+        let browser = {
+            let guard = self.state.lock().await;
+            let state = guard.as_ref().ok_or(BrowserRuntimeError::NotInitialized)?;
+            state.browser.clone()
+        };
+
+        let pages = browser.pages().await.map_err(map_chromiumoxide_error)?;
+
+        if pages.is_empty() {
+            return Ok(());
+        }
+
+        let mut guard = self.state.lock().await;
+        if let Some(state) = guard.as_mut() {
+            for page in pages {
+                let id = page.target_id().as_ref().to_string();
+                state.pages.entry(id).or_insert(page);
+            }
+        }
+
+        Ok(())
+    }
+
     async fn set_remote_state(
         &self,
         remote: BrowserbaseRuntimeState,
@@ -257,6 +287,7 @@ impl BrowserRuntime for ChromiumoxideRuntime {
 
         attach_to_cdp(&self.state, &remote_state.connect_url).await?;
         self.set_remote_state(remote_state).await?;
+        self.populate_initial_pages().await?;
 
         Ok(())
     }
@@ -274,6 +305,8 @@ impl BrowserRuntime for ChromiumoxideRuntime {
                 launch_persistent(&self.state, plan).await?;
             }
         }
+
+        self.populate_initial_pages().await?;
 
         Ok(())
     }
@@ -312,6 +345,35 @@ impl BrowserRuntime for ChromiumoxideRuntime {
         } else {
             Ok(None)
         }
+    }
+
+    async fn list_pages(&self) -> Result<Vec<String>, BrowserRuntimeError> {
+        let guard = self.state.lock().await;
+        let state = guard.as_ref().ok_or(BrowserRuntimeError::NotInitialized)?;
+        Ok(state.pages.keys().cloned().collect())
+    }
+}
+
+#[async_trait]
+impl BrowserRuntime for Arc<ChromiumoxideRuntime> {
+    async fn connect_browserbase(&self, plan: &BrowserbasePlan) -> Result<(), BrowserRuntimeError> {
+        (**self).connect_browserbase(plan).await
+    }
+
+    async fn launch_local(&self, plan: &LocalPlan) -> Result<(), BrowserRuntimeError> {
+        (**self).launch_local(plan).await
+    }
+
+    async fn new_page(&self, url: &str) -> Result<String, BrowserRuntimeError> {
+        (**self).new_page(url).await
+    }
+
+    async fn page_content(&self, page_id: &str) -> Result<Option<String>, BrowserRuntimeError> {
+        (**self).page_content(page_id).await
+    }
+
+    async fn list_pages(&self) -> Result<Vec<String>, BrowserRuntimeError> {
+        (**self).list_pages().await
     }
 }
 

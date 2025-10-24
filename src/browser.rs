@@ -191,6 +191,8 @@ pub trait BrowserRuntime: Send + Sync {
     async fn new_page(&self, url: &str) -> Result<String, BrowserRuntimeError>;
 
     async fn page_content(&self, page_id: &str) -> Result<Option<String>, BrowserRuntimeError>;
+
+    async fn list_pages(&self) -> Result<Vec<String>, BrowserRuntimeError>;
 }
 
 #[derive(Debug, Error)]
@@ -489,6 +491,10 @@ impl<R: BrowserRuntime> StagehandBrowser<R> {
         &self.runtime
     }
 
+    pub fn config(&self) -> &StagehandConfig {
+        self.manager.config()
+    }
+
     pub fn plan(&self) -> BrowserPlan {
         self.manager.plan()
     }
@@ -656,6 +662,10 @@ mod tests {
 
         async fn page_content(&self, page_id: &str) -> Result<Option<String>, BrowserRuntimeError> {
             Ok(self.pages.lock().unwrap().get(page_id).cloned())
+        }
+
+        async fn list_pages(&self) -> Result<Vec<String>, BrowserRuntimeError> {
+            Ok(self.pages.lock().unwrap().keys().cloned().collect())
         }
     }
 

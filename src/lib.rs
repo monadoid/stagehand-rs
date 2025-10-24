@@ -1,6 +1,13 @@
+pub mod a11y;
+pub mod adapter;
 pub mod browser;
 pub mod client;
 pub mod config;
 pub mod context;
+pub mod dom_scripts;
 pub mod llm;
+pub mod logging;
+pub mod metrics;
+pub mod page;
 pub mod runtime;
+pub mod types;

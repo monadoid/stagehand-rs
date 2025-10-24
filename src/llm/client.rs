@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 #[allow(deprecated)]
@@ -14,6 +14,7 @@ use async_openai::types::{
 };
 
 use crate::config::{LoggerCallback, StagehandConfig};
+use crate::metrics::{StagehandFunctionName, StagehandMetrics};
 
 use super::error::StagehandLlmError;
 use super::openai::OpenAiChatProvider;
@@ -65,6 +66,7 @@ pub struct StagehandLlmClient<P: ChatCompletionProvider> {
     default_model: String,
     logger: Option<LoggerCallback>,
     metrics_callback: Option<MetricsCallback>,
+    metrics: Option<Arc<Mutex<StagehandMetrics>>>,
 }
 
 impl<P> fmt::Debug for StagehandLlmClient<P>
@@ -77,6 +79,7 @@ where
             .field("default_model", &self.default_model)
             .field("logger_attached", &self.logger.is_some())
             .field("metrics_callback", &self.metrics_callback.is_some())
+            .field("metrics_store", &self.metrics.is_some())
             .finish()
     }
 }
@@ -89,6 +92,7 @@ impl<P: ChatCompletionProvider> StagehandLlmClient<P> {
             default_model: default_model.into(),
             logger: None,
             metrics_callback: None,
+            metrics: None,
         }
     }
 
@@ -104,6 +108,12 @@ impl<P: ChatCompletionProvider> StagehandLlmClient<P> {
         self
     }
 
+    /// Attach a shared metrics accumulator that will be updated automatically.
+    pub fn with_metrics_store(mut self, metrics: Option<Arc<Mutex<StagehandMetrics>>>) -> Self {
+        self.metrics = metrics;
+        self
+    }
+
     /// Update the logger callback.
     pub fn set_logger(&mut self, logger: Option<LoggerCallback>) {
         self.logger = logger;
@@ -112,6 +122,16 @@ impl<P: ChatCompletionProvider> StagehandLlmClient<P> {
     /// Update the metrics callback.
     pub fn set_metrics_callback(&mut self, callback: Option<MetricsCallback>) {
         self.metrics_callback = callback;
+    }
+
+    /// Update the metrics store reference.
+    pub fn set_metrics_store(&mut self, metrics: Option<Arc<Mutex<StagehandMetrics>>>) {
+        self.metrics = metrics;
+    }
+
+    /// Clone the metrics store handle if configured.
+    pub fn metrics_store(&self) -> Option<Arc<Mutex<StagehandMetrics>>> {
+        self.metrics.as_ref().map(Arc::clone)
     }
 
     /// Access the default model configured for this client.
@@ -191,6 +211,7 @@ impl<P: ChatCompletionProvider> StagehandLlmClient<P> {
         match self.provider.create_chat_completion(request).await {
             Ok(response) => {
                 let elapsed = start.elapsed();
+                self.record_metrics(function_name, &response, elapsed);
                 if let Some(callback) = &self.metrics_callback {
                     callback(&response, elapsed, function_name);
                 }
@@ -222,6 +243,34 @@ impl<P: ChatCompletionProvider> StagehandLlmClient<P> {
             logger(&format!("[llm][error] {message}"));
         }
     }
+
+    fn record_metrics(
+        &self,
+        function_name: Option<&str>,
+        response: &CreateChatCompletionResponse,
+        elapsed: Duration,
+    ) {
+        let Some(store) = &self.metrics else {
+            return;
+        };
+        let Some(usage) = response.usage.as_ref() else {
+            return;
+        };
+
+        let prompt_tokens = u64::from(usage.prompt_tokens);
+        let completion_tokens = u64::from(usage.completion_tokens);
+        let inference_time_ms = elapsed.as_millis() as u64;
+        let function = parse_function_name(function_name);
+
+        if let Ok(mut guard) = store.lock() {
+            guard.record(
+                function,
+                prompt_tokens,
+                completion_tokens,
+                inference_time_ms,
+            );
+        }
+    }
 }
 
 impl StagehandLlmClient<OpenAiChatProvider> {
@@ -231,10 +280,20 @@ impl StagehandLlmClient<OpenAiChatProvider> {
         metrics_callback: Option<MetricsCallback>,
     ) -> Result<Self, StagehandLlmError> {
         let provider = OpenAiChatProvider::from_config(config)?;
-        let mut client = StagehandLlmClient::new(config.model_name.as_str(), provider);
-        client.set_logger(config.logger.clone());
+        let mut client = StagehandLlmClient::new(config.model_name.as_str(), provider)
+            .with_logger(config.logger.clone());
         client.set_metrics_callback(metrics_callback);
         Ok(client)
+    }
+}
+
+fn parse_function_name(name: Option<&str>) -> StagehandFunctionName {
+    match name.map(|n| n.trim().to_ascii_uppercase()) {
+        Some(ref n) if n == "ACT" => StagehandFunctionName::Act,
+        Some(ref n) if n == "EXTRACT" => StagehandFunctionName::Extract,
+        Some(ref n) if n == "OBSERVE" => StagehandFunctionName::Observe,
+        Some(ref n) if n == "AGENT" => StagehandFunctionName::Agent,
+        _ => StagehandFunctionName::Agent,
     }
 }
 
@@ -376,6 +435,7 @@ mod tests {
     use tokio::sync::Mutex;
 
     use super::super::provider::ChatCompletionProvider;
+    use crate::metrics::StagehandMetrics;
 
     #[derive(Debug, Default)]
     struct RecordingProvider {
@@ -505,6 +565,29 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].0.as_deref(), Some("act"));
         assert!(calls[0].1 >= Duration::ZERO);
+    }
+
+    #[tokio::test]
+    async fn metrics_store_records_usage() {
+        let provider = RecordingProvider::with_response(sample_response());
+        let metrics_store = Arc::new(std::sync::Mutex::new(StagehandMetrics::default()));
+        let client = StagehandLlmClient::new("gpt-4o", provider)
+            .with_metrics_store(Some(Arc::clone(&metrics_store)));
+
+        client
+            .create_chat_completion(
+                sample_messages(),
+                ChatCompletionOptions::default(),
+                Some("OBSERVE"),
+            )
+            .await
+            .expect("completion succeeds");
+
+        let metrics = metrics_store.lock().unwrap().clone();
+        assert_eq!(metrics.observe_prompt_tokens, 10);
+        assert_eq!(metrics.observe_completion_tokens, 5);
+        assert_eq!(metrics.total_prompt_tokens, 10);
+        assert_eq!(metrics.total_completion_tokens, 5);
     }
 
     #[tokio::test]
