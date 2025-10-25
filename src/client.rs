@@ -4,16 +4,21 @@
 //! logic with the `StagehandContext` wrapper, providing a stub implementation
 //! that we can grow towards the full Python feature set.
 
+use std::io;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use chrono::Utc;
 use futures_util::future::BoxFuture;
+use futures_util::{StreamExt, TryStreamExt};
 use reqwest::Client as HttpClient;
-use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
-use serde_json::{Value as JsonValue, json};
+use reqwest::header::{CONNECTION, CONTENT_TYPE, HeaderMap, HeaderValue};
+use serde_json::{Map as JsonMap, Value as JsonValue, json};
 use thiserror::Error;
 use tokio::sync::Mutex as AsyncMutex;
+use tokio_util::codec::{FramedRead, LinesCodec};
+use tokio_util::io::StreamReader;
 
 use crate::browser::{
     BrowserError, BrowserPlan, BrowserRuntime, BrowserRuntimeError, StagehandBrowser,
@@ -22,7 +27,7 @@ use crate::config::{Environment, LoggerCallback, StagehandConfig};
 use crate::context::{StagehandAdapter, StagehandContext, StagehandContextError};
 use crate::dom_scripts;
 use crate::llm::{OpenAiChatProvider, StagehandLlmClient, StagehandLlmError};
-use crate::logging::{LogCallback, LogConfig, StagehandLogger};
+use crate::logging::{LogCallback, LogConfig, StagehandLogger, sync_log_handler};
 use crate::metrics::{StagehandFunctionName, StagehandMetrics};
 use crate::runtime::ChromiumoxideRuntime;
 
@@ -32,6 +37,20 @@ pub struct HttpResponse {
     body: String,
 }
 
+const MAX_SSE_LINE_LENGTH: usize = 1_048_576;
+
+pub type BoxLineStream = Pin<
+    Box<
+        dyn futures_util::stream::Stream<Item = Result<String, StagehandClientError>>
+            + Send
+            + 'static,
+    >,
+>;
+
+pub struct StreamingHttpResponse {
+    pub stream: BoxLineStream,
+}
+
 #[async_trait]
 pub trait StagehandHttp: Send + Sync {
     async fn post_json(
@@ -39,6 +58,19 @@ pub trait StagehandHttp: Send + Sync {
         url: &str,
         headers: HeaderMap,
         body: &JsonValue,
+    ) -> Result<HttpResponse, StagehandClientError>;
+
+    async fn post_streaming_lines(
+        &self,
+        url: &str,
+        headers: HeaderMap,
+        body: &JsonValue,
+    ) -> Result<StreamingHttpResponse, StagehandClientError>;
+
+    async fn get_json(
+        &self,
+        url: &str,
+        headers: HeaderMap,
     ) -> Result<HttpResponse, StagehandClientError>;
 }
 
@@ -60,6 +92,68 @@ impl StagehandHttp for ReqwestStagehandHttpClient {
             .post(url)
             .headers(headers)
             .json(body)
+            .send()
+            .await
+            .map_err(|err| StagehandClientError::Http(err.to_string()))?;
+        let status = response.status().as_u16();
+        let body = response
+            .text()
+            .await
+            .map_err(|err| StagehandClientError::Http(err.to_string()))?;
+        Ok(HttpResponse { status, body })
+    }
+
+    async fn post_streaming_lines(
+        &self,
+        url: &str,
+        headers: HeaderMap,
+        body: &JsonValue,
+    ) -> Result<StreamingHttpResponse, StagehandClientError> {
+        let response = self
+            .client
+            .post(url)
+            .headers(headers)
+            .json(body)
+            .send()
+            .await
+            .map_err(|err| StagehandClientError::Http(err.to_string()))?;
+
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let body = response
+                .text()
+                .await
+                .map_err(|err| StagehandClientError::Http(err.to_string()))?;
+            return Err(StagehandClientError::Api(format!(
+                "request failed with status {}: {}",
+                status, body
+            )));
+        }
+
+        let byte_stream = response
+            .bytes_stream()
+            .map_err(|err| io::Error::new(io::ErrorKind::Other, err));
+        let reader = StreamReader::new(byte_stream);
+        let lines = FramedRead::new(reader, LinesCodec::new_with_max_length(MAX_SSE_LINE_LENGTH));
+        let stream = lines.map(|result| match result {
+            Ok(line) => Ok(line),
+            Err(err) => Err(StagehandClientError::Http(err.to_string())),
+        });
+
+        Ok(StreamingHttpResponse {
+            stream: Box::pin(stream),
+        })
+    }
+
+    async fn get_json(
+        &self,
+        url: &str,
+        headers: HeaderMap,
+    ) -> Result<HttpResponse, StagehandClientError> {
+        let response = self
+            .client
+            .get(url)
+            .headers(headers)
             .send()
             .await
             .map_err(|err| StagehandClientError::Http(err.to_string()))?;
@@ -255,6 +349,53 @@ impl<R: BrowserRuntime + 'static> StagehandClient<R> {
         Arc::clone(&self.metrics)
     }
 
+    pub async fn fetch_replay_metrics(&self) -> Result<StagehandMetrics, StagehandClientError> {
+        if !self.use_api() {
+            return Ok(match self.metrics.lock() {
+                Ok(guard) => guard.clone(),
+                Err(_) => StagehandMetrics::default(),
+            });
+        }
+
+        let config = self.config();
+        let api_key = config
+            .api_key
+            .clone()
+            .ok_or_else(|| StagehandClientError::Api("browserbase API key is required".into()))?;
+        let project_id = config.project_id.clone().ok_or_else(|| {
+            StagehandClientError::Api("browserbase project id is required".into())
+        })?;
+
+        let session_id = self.ensure_session().await?;
+        let url = format!("{}/sessions/{}/replay", self.base_api_url(), session_id);
+
+        let headers = self.base_headers(&api_key, &project_id)?;
+        let response = self.http_client.get_json(&url, headers).await?;
+
+        if response.status != 200 {
+            return Err(StagehandClientError::Api(format!(
+                "failed to fetch replay metrics: status {}: {}",
+                response.status, response.body
+            )));
+        }
+
+        let body: JsonValue = serde_json::from_str(&response.body)?;
+        if !body
+            .get("success")
+            .and_then(JsonValue::as_bool)
+            .unwrap_or(false)
+        {
+            let message = body
+                .get("error")
+                .and_then(JsonValue::as_str)
+                .unwrap_or("Unknown error");
+            return Err(StagehandClientError::Api(message.to_string()));
+        }
+
+        let metrics = parse_replay_metrics(body.get("data").unwrap_or(&JsonValue::Null));
+        Ok(metrics)
+    }
+
     pub fn create_llm_client(
         &self,
     ) -> Result<StagehandLlmClient<OpenAiChatProvider>, StagehandLlmError> {
@@ -441,10 +582,12 @@ impl<R: BrowserRuntime + 'static> StagehandClient<R> {
             crate::config::Verbosity::Detailed => 2u8,
         };
 
-        let create_params = config
-            .browserbase_session_create_params()
-            .map(JsonValue::Object)
-            .unwrap_or_else(default_session_params);
+        let create_params = prepare_session_create_params(
+            config
+                .browserbase_session_create_params()
+                .map(JsonValue::Object)
+                .unwrap_or_else(default_session_params),
+        );
 
         let mut payload = json!({
             "modelName": config.model_name.as_str(),
@@ -513,21 +656,172 @@ impl<R: BrowserRuntime + 'static> StagehandClient<R> {
         let session_id = self.ensure_session().await?;
         let url = format!("{}/sessions/{}/{}", self.base_api_url(), session_id, method);
 
+        let prepared_payload = self.prepare_execute_payload(payload);
+
         let _lock = self.session_lock.lock().await;
         let headers = self.build_execute_headers()?;
-        let response = self.http_client.post_json(&url, headers, &payload).await?;
+        let mut response = self
+            .http_client
+            .post_streaming_lines(&url, headers, &prepared_payload)
+            .await?;
 
-        if response.status != 200 {
-            return Err(StagehandClientError::Api(format!(
-                "request failed with status {}: {}",
-                response.status, response.body
-            )));
+        let mut final_result: Option<JsonValue> = None;
+        while let Some(line_result) = response.stream.next().await {
+            let line = line_result?;
+            let trimmed = line.trim();
+
+            if trimmed.is_empty() || trimmed.starts_with(':') {
+                continue;
+            }
+
+            let data_segment = trimmed.strip_prefix("data: ").unwrap_or(trimmed);
+            if data_segment.trim().is_empty() {
+                continue;
+            }
+
+            match serde_json::from_str::<JsonValue>(data_segment) {
+                Ok(message) => match self.handle_stream_message(&message) {
+                    Ok(Some(result)) => final_result = Some(result),
+                    Ok(None) => {}
+                    Err(err) => return Err(err),
+                },
+                Err(err) => {
+                    self.logger.error(
+                        format!("Could not parse SSE line: {} ({err})", data_segment),
+                        Some("api"),
+                        None,
+                    );
+                }
+            }
         }
 
-        let body: JsonValue = serde_json::from_str(&response.body)?;
-        Ok(body)
+        final_result
+            .ok_or_else(|| StagehandClientError::Api("API stream finished without a result".into()))
     }
 
+    fn prepare_execute_payload(&self, mut payload: JsonValue) -> JsonValue {
+        if let Some(base_url) = self.resolve_model_base_url(&payload) {
+            if let Some(obj) = payload.as_object_mut() {
+                let entry = obj
+                    .entry("modelClientOptions".to_string())
+                    .or_insert_with(|| JsonValue::Object(JsonMap::new()));
+                if let Some(options) = entry.as_object_mut() {
+                    options.insert("baseURL".to_string(), JsonValue::String(base_url));
+                    options.remove("api_base");
+                }
+            }
+        }
+
+        convert_keys_to_camel_case(payload)
+    }
+
+    fn resolve_model_base_url(&self, payload: &JsonValue) -> Option<String> {
+        let payload_options = payload
+            .get("modelClientOptions")
+            .and_then(JsonValue::as_object);
+        let config_options = self.config().model_client_options.as_ref();
+        lookup_base_url(payload_options, config_options)
+    }
+
+    fn handle_stream_message(
+        &self,
+        message: &JsonValue,
+    ) -> Result<Option<JsonValue>, StagehandClientError> {
+        match message.get("type").and_then(JsonValue::as_str) {
+            Some("system") => {
+                if let Some(data) = message.get("data") {
+                    self.handle_system_message(data)
+                } else {
+                    Ok(None)
+                }
+            }
+            Some("log") => {
+                if let Some(payload) = message.get("data") {
+                    self.handle_log_payload(payload);
+                }
+                Ok(None)
+            }
+            Some("metrics") => {
+                if let Some(payload) = message.get("data") {
+                    self.handle_metrics_payload(payload);
+                }
+                Ok(None)
+            }
+            Some(other) => {
+                self.logger.debug(
+                    format!("Unhandled API message type: {}", other),
+                    Some("api"),
+                    Some(message.clone()),
+                );
+                Ok(None)
+            }
+            None => Ok(None),
+        }
+    }
+
+    fn handle_system_message(
+        &self,
+        data: &JsonValue,
+    ) -> Result<Option<JsonValue>, StagehandClientError> {
+        match data
+            .get("status")
+            .and_then(JsonValue::as_str)
+            .unwrap_or_default()
+        {
+            "error" => {
+                let error_message = data
+                    .get("error")
+                    .and_then(JsonValue::as_str)
+                    .unwrap_or("Unknown error");
+                self.logger
+                    .error(error_message.to_string(), Some("api"), Some(data.clone()));
+                Err(StagehandClientError::Api(error_message.to_string()))
+            }
+            "finished" => Ok(data.get("result").cloned()),
+            _ => Ok(None),
+        }
+    }
+
+    fn handle_log_payload(&self, payload: &JsonValue) {
+        let logger = self.logger();
+        sync_log_handler(payload, logger.as_ref());
+    }
+
+    fn handle_metrics_payload(&self, payload: &JsonValue) {
+        let function_name = payload
+            .get("function")
+            .or_else(|| payload.get("functionName"))
+            .and_then(JsonValue::as_str);
+        let prompt_tokens = payload
+            .get("promptTokens")
+            .and_then(JsonValue::as_u64)
+            .unwrap_or(0);
+        let completion_tokens = payload
+            .get("completionTokens")
+            .and_then(JsonValue::as_u64)
+            .unwrap_or(0);
+        let inference_time_ms = payload
+            .get("inferenceTimeMs")
+            .and_then(JsonValue::as_u64)
+            .unwrap_or(0);
+
+        if let Some(name) = function_name {
+            if let Some(function) = stagehand_function_from_str(name) {
+                self.update_metrics(
+                    function,
+                    prompt_tokens,
+                    completion_tokens,
+                    inference_time_ms,
+                );
+            } else if prompt_tokens > 0 || completion_tokens > 0 || inference_time_ms > 0 {
+                if let Ok(mut guard) = self.metrics.lock() {
+                    guard.total_prompt_tokens += prompt_tokens;
+                    guard.total_completion_tokens += completion_tokens;
+                    guard.total_inference_time_ms += inference_time_ms;
+                }
+            }
+        }
+    }
     fn base_api_url(&self) -> String {
         self.config().api_url.trim_end_matches('/').to_string()
     }
@@ -572,7 +866,8 @@ impl<R: BrowserRuntime + 'static> StagehandClient<R> {
                     .map_err(|err| StagehandClientError::Api(err.to_string()))?,
             );
         }
-        headers.insert("x-stream-response", HeaderValue::from_static("false"));
+        headers.insert("x-stream-response", HeaderValue::from_static("true"));
+        headers.insert(CONNECTION, HeaderValue::from_static("keep-alive"));
         Ok(headers)
     }
 }
@@ -633,6 +928,136 @@ fn default_session_params() -> JsonValue {
 
 fn header_value(value: &str) -> Result<HeaderValue, reqwest::header::InvalidHeaderValue> {
     HeaderValue::from_str(value)
+}
+
+fn lookup_base_url(
+    payload_options: Option<&JsonMap<String, JsonValue>>,
+    config_options: Option<&JsonMap<String, JsonValue>>,
+) -> Option<String> {
+    let candidates = [
+        payload_options
+            .and_then(|opts| opts.get("baseURL"))
+            .and_then(JsonValue::as_str),
+        payload_options
+            .and_then(|opts| opts.get("api_base"))
+            .and_then(JsonValue::as_str),
+        config_options
+            .and_then(|opts| opts.get("baseURL"))
+            .and_then(JsonValue::as_str),
+        config_options
+            .and_then(|opts| opts.get("api_base"))
+            .and_then(JsonValue::as_str),
+    ];
+
+    for candidate in candidates.into_iter().flatten() {
+        if !candidate.is_empty() {
+            return Some(candidate.to_string());
+        }
+    }
+
+    None
+}
+
+fn stagehand_function_from_str(name: &str) -> Option<StagehandFunctionName> {
+    match name.to_ascii_lowercase().as_str() {
+        "act" => Some(StagehandFunctionName::Act),
+        "extract" => Some(StagehandFunctionName::Extract),
+        "observe" => Some(StagehandFunctionName::Observe),
+        "agent" => Some(StagehandFunctionName::Agent),
+        _ => None,
+    }
+}
+
+fn convert_keys_to_camel_case(value: JsonValue) -> JsonValue {
+    match value {
+        JsonValue::Object(map) => {
+            let mut converted = JsonMap::new();
+            for (key, inner) in map {
+                converted.insert(snake_to_camel_case(&key), convert_keys_to_camel_case(inner));
+            }
+            JsonValue::Object(converted)
+        }
+        JsonValue::Array(items) => {
+            JsonValue::Array(items.into_iter().map(convert_keys_to_camel_case).collect())
+        }
+        other => other,
+    }
+}
+
+fn snake_to_camel_case(value: &str) -> String {
+    if !value.contains('_') {
+        return value.to_string();
+    }
+
+    let mut segments = value.split('_');
+    let mut result = segments.next().unwrap_or_default().to_string();
+    for segment in segments {
+        if segment.is_empty() {
+            continue;
+        }
+        let mut chars = segment.chars();
+        if let Some(first) = chars.next() {
+            result.push(first.to_ascii_uppercase());
+            for ch in chars {
+                result.push(ch.to_ascii_lowercase());
+            }
+        }
+    }
+    result
+}
+
+fn prepare_session_create_params(value: JsonValue) -> JsonValue {
+    let mut converted = convert_keys_to_camel_case(value);
+    if let Some(obj) = converted.as_object_mut() {
+        if let Some(timeout) = obj.remove("apiTimeout") {
+            obj.insert("timeout".to_string(), timeout);
+        }
+    }
+    converted
+}
+
+fn parse_replay_metrics(data: &JsonValue) -> StagehandMetrics {
+    let mut metrics = StagehandMetrics::default();
+
+    if let Some(pages) = data.get("pages").and_then(JsonValue::as_array) {
+        for page in pages {
+            if let Some(actions) = page.get("actions").and_then(JsonValue::as_array) {
+                for action in actions {
+                    let method = action
+                        .get("method")
+                        .and_then(JsonValue::as_str)
+                        .unwrap_or("");
+                    if let Some(usage) = action.get("tokenUsage").and_then(JsonValue::as_object) {
+                        let prompt_tokens = usage
+                            .get("inputTokens")
+                            .and_then(JsonValue::as_u64)
+                            .unwrap_or(0);
+                        let completion_tokens = usage
+                            .get("outputTokens")
+                            .and_then(JsonValue::as_u64)
+                            .unwrap_or(0);
+                        let inference_time_ms =
+                            usage.get("timeMs").and_then(JsonValue::as_u64).unwrap_or(0);
+
+                        if let Some(function) = stagehand_function_from_str(method) {
+                            metrics.record(
+                                function,
+                                prompt_tokens,
+                                completion_tokens,
+                                inference_time_ms,
+                            );
+                        } else {
+                            metrics.total_prompt_tokens += prompt_tokens;
+                            metrics.total_completion_tokens += completion_tokens;
+                            metrics.total_inference_time_ms += inference_time_ms;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    metrics
 }
 
 #[cfg(test)]
@@ -700,20 +1125,57 @@ mod tests {
 
     #[derive(Default)]
     struct MockHttpClient {
-        responses: Mutex<Vec<HttpResponse>>,
+        post_json_responses: Mutex<Vec<HttpResponse>>,
+        post_stream_responses: Mutex<Vec<MockStreamResponse>>,
+        get_responses: Mutex<Vec<HttpResponse>>,
         requests: Mutex<Vec<(String, JsonValue)>>,
+        get_requests: Mutex<Vec<String>>,
+    }
+
+    struct MockStreamResponse {
+        status: u16,
+        lines: Vec<String>,
+        error_body: Option<String>,
+    }
+
+    impl MockStreamResponse {
+        fn success(lines: Vec<String>) -> Self {
+            Self {
+                status: 200,
+                lines,
+                error_body: None,
+            }
+        }
     }
 
     impl MockHttpClient {
-        fn new(responses: Vec<HttpResponse>) -> Self {
+        fn new(post_json_responses: Vec<HttpResponse>) -> Self {
             Self {
-                responses: Mutex::new(responses),
+                post_json_responses: Mutex::new(post_json_responses),
+                ..Default::default()
+            }
+        }
+
+        fn with_stream_and_get(
+            post_json_responses: Vec<HttpResponse>,
+            stream_responses: Vec<MockStreamResponse>,
+            get_responses: Vec<HttpResponse>,
+        ) -> Self {
+            Self {
+                post_json_responses: Mutex::new(post_json_responses),
+                post_stream_responses: Mutex::new(stream_responses),
+                get_responses: Mutex::new(get_responses),
                 requests: Mutex::new(Vec::new()),
+                get_requests: Mutex::new(Vec::new()),
             }
         }
 
         fn recorded_requests(&self) -> Vec<(String, JsonValue)> {
             self.requests.lock().unwrap().clone()
+        }
+
+        fn recorded_get_requests(&self) -> Vec<String> {
+            self.get_requests.lock().unwrap().clone()
         }
     }
 
@@ -725,16 +1187,71 @@ mod tests {
             _headers: HeaderMap,
             body: &JsonValue,
         ) -> Result<HttpResponse, StagehandClientError> {
-            let mut responses = self.responses.lock().unwrap();
+            self.requests
+                .lock()
+                .unwrap()
+                .push((url.to_string(), body.clone()));
+            let mut responses = self.post_json_responses.lock().unwrap();
             if responses.is_empty() {
                 return Err(StagehandClientError::Api(
                     "no mock response available".into(),
                 ));
             }
+            Ok(responses.remove(0))
+        }
+
+        async fn post_streaming_lines(
+            &self,
+            url: &str,
+            _headers: HeaderMap,
+            body: &JsonValue,
+        ) -> Result<StreamingHttpResponse, StagehandClientError> {
             self.requests
                 .lock()
                 .unwrap()
                 .push((url.to_string(), body.clone()));
+
+            let mut responses = self.post_stream_responses.lock().unwrap();
+            if responses.is_empty() {
+                return Err(StagehandClientError::Api(
+                    "no mock stream response available".into(),
+                ));
+            }
+            let response = responses.remove(0);
+
+            if response.status != 200 {
+                return Err(StagehandClientError::Api(format!(
+                    "request failed with status {}: {}",
+                    response.status,
+                    response.error_body.unwrap_or_default()
+                )));
+            }
+
+            let stream = futures_util::stream::iter(
+                response
+                    .lines
+                    .into_iter()
+                    .map(|line| Ok::<String, StagehandClientError>(line)),
+            );
+
+            Ok(StreamingHttpResponse {
+                stream: Box::pin(stream),
+            })
+        }
+
+        async fn get_json(
+            &self,
+            url: &str,
+            _headers: HeaderMap,
+        ) -> Result<HttpResponse, StagehandClientError> {
+            self.get_requests.lock().unwrap().push(url.to_string());
+
+            let mut responses = self.get_responses.lock().unwrap();
+            if responses.is_empty() {
+                return Err(StagehandClientError::Api(
+                    "no mock get response available".into(),
+                ));
+            }
             Ok(responses.remove(0))
         }
     }
@@ -996,17 +1513,19 @@ mod tests {
 
     #[tokio::test]
     async fn stagehand_page_act_calls_remote_api() {
-        let responses = vec![
-            HttpResponse {
-                status: 200,
-                body: r#"{"success":true,"data":{"sessionId":"sess-1"}}"#.to_string(),
-            },
-            HttpResponse {
-                status: 200,
-                body: r#"{"success":true,"message":"ok","action":"click","metadata":{"promptTokens":10,"completionTokens":5,"inferenceTimeMs":120}}"#.to_string(),
-            },
-        ];
-        let mock_http = Arc::new(MockHttpClient::new(responses));
+        let post_json_responses = vec![HttpResponse {
+            status: 200,
+            body: r#"{"success":true,"data":{"sessionId":"sess-1"}}"#.to_string(),
+        }];
+        let stream_responses = vec![MockStreamResponse::success(vec![
+            r#"data: {"type":"log","data":{"message":{"message":"Act completed","level":1,"category":"act"}}}"#.to_string(),
+            r#"data: {"type":"system","data":{"status":"finished","result":{"success":true,"action":"click","message":"ok","metadata":{"promptTokens":10,"completionTokens":5,"inferenceTimeMs":120}}}}"#.to_string(),
+        ])];
+        let mock_http = Arc::new(MockHttpClient::with_stream_and_get(
+            post_json_responses,
+            stream_responses,
+            vec![],
+        ));
 
         let mut config = StagehandConfig::default();
         config.env = Environment::Local;
@@ -1057,5 +1576,55 @@ mod tests {
         assert!(requests[0].0.ends_with("/sessions/start"));
         assert!(requests[1].0.ends_with("/sessions/sess-1/act"));
         assert!(requests[1].1.to_string().contains("\"action\":\"click\""));
+    }
+
+    #[tokio::test]
+    async fn fetch_replay_metrics_aggregates_usage() {
+        let post_json_responses = vec![HttpResponse {
+            status: 200,
+            body: r#"{"success":true,"data":{"sessionId":"sess-2"}}"#.to_string(),
+        }];
+        let get_responses = vec![HttpResponse {
+            status: 200,
+            body: r#"{"success":true,"data":{"pages":[{"actions":[{"method":"act","tokenUsage":{"inputTokens":4,"outputTokens":2,"timeMs":50}},{"method":"observe","tokenUsage":{"inputTokens":1,"outputTokens":1,"timeMs":20}}]}]}}"#.to_string(),
+        }];
+
+        let mock_http = Arc::new(MockHttpClient::with_stream_and_get(
+            post_json_responses,
+            Vec::new(),
+            get_responses,
+        ));
+
+        let mut config = StagehandConfig::default();
+        config.env = Environment::Local;
+        config.use_api = true;
+        config.api_key = Some("bb-key".into());
+        config.project_id = Some("proj-1".into());
+        config.model_api_key = Some("model-key".into());
+        config.api_url = "https://example.com".into();
+
+        let runtime = RecordingRuntime::default();
+        let adapter = Arc::new(RecordingAdapter::default());
+        let client = StagehandClient::new_with_http_client(
+            config,
+            runtime,
+            adapter,
+            dom_scripts::stagehand_dom_script(),
+            mock_http.clone(),
+        )
+        .expect("client");
+
+        let metrics = client.fetch_replay_metrics().await.expect("metrics");
+        assert_eq!(metrics.act_prompt_tokens, 4);
+        assert_eq!(metrics.act_completion_tokens, 2);
+        assert_eq!(metrics.observe_prompt_tokens, 1);
+        assert_eq!(metrics.observe_completion_tokens, 1);
+        assert_eq!(metrics.total_prompt_tokens, 5);
+        assert_eq!(metrics.total_completion_tokens, 3);
+        assert_eq!(metrics.total_inference_time_ms, 70);
+
+        let get_requests = mock_http.recorded_get_requests();
+        assert_eq!(get_requests.len(), 1);
+        assert!(get_requests[0].ends_with("/sessions/sess-2/replay"));
     }
 }

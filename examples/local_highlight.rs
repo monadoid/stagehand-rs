@@ -11,9 +11,10 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use serde_json::Value;
-use stagehand_rs::client::StagehandClient;
 use stagehand_rs::config::{Environment, StagehandConfig, Verbosity};
 use stagehand_rs::runtime::ChromiumoxideRuntime;
+use stagehand_rs::stagehand::Stagehand;
+use stagehand_rs::types::page::{ActOptions, ExtractOptions, ObserveOptions};
 use tokio::time::sleep;
 
 #[tokio::main]
@@ -32,56 +33,93 @@ async fn main() -> Result<()> {
         .local_browser_launch_options
         .insert("chromeExecutable".to_string(), Value::String(chrome_bin));
 
+    // Provide the LLM key so local act/observe/extract calls can execute.
+    let model_api_key = env::var("MODEL_API_KEY")
+        .or_else(|_| env::var("OPENAI_API_KEY"))
+        .map_err(|_| anyhow!("Set MODEL_API_KEY or OPENAI_API_KEY for local LLM calls"))?;
+    config.model_api_key = Some(model_api_key.clone());
+    let mut client_options = serde_json::Map::new();
+    client_options.insert("apiKey".to_string(), Value::String(model_api_key));
+    config.model_client_options = Some(client_options);
+
     let runtime = Arc::new(ChromiumoxideRuntime::new());
-    let client = StagehandClient::with_chromiumoxide_runtime(config, runtime.clone())
-        .context("failed to construct stagehand client")?;
+    let stagehand =
+        Stagehand::new_local(config, runtime).context("failed to construct stagehand client")?;
 
-    client
-        .ensure_initialized()
+    stagehand
+        .init()
         .await
-        .context("failed to initialise runtime")?;
+        .context("failed to initialise stagehand runtime")?;
 
-    let page_id = client
+    let page = stagehand
         .open_page("https://example.com")
         .await
         .context("failed to open example.com")?;
 
-    // Highlight the first paragraph so the selection is visible in the launched window.
-    let page = client.page(page_id.clone());
-    let select_script = r#"
-        (function() {
-            const el = document.querySelector('p');
-            if (!el) {
-                return null;
-            }
-            const range = document.createRange();
-            range.selectNodeContents(el);
-            const selection = window.getSelection();
-            selection.removeAllRanges();
-            selection.addRange(range);
-            return el.textContent || null;
-        })()
-    "#;
-
-    let result = page
-        .evaluate_expression(select_script)
+    // Ask Stagehand to observe the page and list relevant elements.
+    let observe_options = ObserveOptions {
+        instruction:
+            "Identify the primary content on this page whose heading reads 'Example Domain'. \
+            Return the heading along with the descriptive paragraph."
+                .to_string(),
+        model_name: None,
+        draw_overlay: Some(false),
+        dom_settle_timeout_ms: None,
+        model_client_options: None,
+    };
+    let observations = page
+        .observe(observe_options)
         .await
-        .context("failed to evaluate selection script")?;
-    let paragraph = result
-        .as_str()
-        .map(str::to_owned)
-        .unwrap_or_else(|| "<paragraph not found>".to_string());
+        .context("observe failed")?;
 
-    println!("\nSelected paragraph:\n{}\n", paragraph.trim());
+    if let Some(first) = observations.first() {
+        println!(
+            "First observed element: {} via {}",
+            first.description,
+            first
+                .method
+                .clone()
+                .unwrap_or_else(|| "unknown".to_string())
+        );
+    }
+
+    // Use extract to pull the main heading text.
+    let extract_options = ExtractOptions {
+        instruction: "Return the main heading text from this page as {\"heading\": \"...\"}"
+            .to_string(),
+        model_name: None,
+        selector: None,
+        schema_definition: Some(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "heading": { "type": "string" }
+            },
+            "required": ["heading"]
+        })),
+        use_text_extract: None,
+        dom_settle_timeout_ms: None,
+        model_client_options: None,
+    };
+    let extract = page
+        .extract(extract_options)
+        .await
+        .context("extract failed")?;
+    println!("Extracted data: {}", extract.data.unwrap_or_default());
+
+    // Ask Stagehand to select the primary paragraph.
+    let act_options = ActOptions {
+        action: "Select the main paragraph on this page so it is highlighted".to_string(),
+        variables: None,
+        model_name: None,
+        dom_settle_timeout_ms: None,
+        timeout_ms: None,
+        model_client_options: None,
+    };
+    let act_result = page.act(act_options).await.context("act failed")?;
+    println!("Act result: {}", act_result.message);
 
     // Keep the window open briefly so the highlight is visible.
     sleep(Duration::from_secs(5)).await;
-
-    // Close the tab before exiting.
-    let _ = page
-        .evaluate_expression("window.close(); true")
-        .await
-        .context("failed to close the tab");
 
     Ok(())
 }

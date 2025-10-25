@@ -28,7 +28,7 @@ fn build_user_instructions_string(user_instructions: Option<&str>) -> Option<Str
 
 pub fn build_observe_system_prompt(user_instructions: Option<&str>) -> String {
     let base = format!(
-        "You are helping the user automate the browser by finding elements based on what the user wants to observe in the page.\n\nYou will be given:\n1. an instruction of elements to observe\n2. a hierarchical accessibility tree showing the semantic structure of the page. The tree is a hybrid of the DOM and the accessibility tree.\n\nReturn an array of elements that match the instruction if they exist, otherwise return an empty array. Whenever suggesting actions, use supported playwright locator methods or preferably one of the following supported actions:\n{}",
+        "You are helping the user automate the browser by finding elements based on what the user wants to observe in the page.\n\nYou will be given:\n1. an instruction of elements to observe\n2. a hierarchical accessibility tree showing the semantic structure of the page. The tree is a hybrid of the DOM and the accessibility tree.\n\nReturn an array of elements that match the instruction if they exist, otherwise return an empty array. Whenever suggesting actions, use supported playwright locator methods or preferably one of the following supported actions:\n{}\n\nRespond with JSON: always return a JSON object with an `elements` array describing the matches.",
         SUPPORTED_ACTIONS.join(", ")
     );
 
@@ -64,6 +64,7 @@ pub fn build_extract_system_prompt(
                 "DOM+accessibility tree elements"
             }
         ),
+        "Respond with JSON: your entire reply must be valid JSON that matches the requested schema or structure.".to_string(),
     ];
 
     if is_using_text_extract {

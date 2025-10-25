@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use async_openai::types::{
@@ -6,13 +6,16 @@ use async_openai::types::{
     ChatCompletionRequestSystemMessageContent, ChatCompletionRequestUserMessageArgs,
     ChatCompletionRequestUserMessageContent, ResponseFormat, ResponseFormatJsonSchema,
 };
+use jsonschema::JSONSchema;
 use serde_json::{Value as JsonValue, json};
 
 use crate::a11y::{
     AccessibilityError, AccessibilityPage, get_accessibility_tree, get_xpath_by_resolved_object_id,
 };
+use crate::browser::BrowserRuntime;
 use crate::client::StagehandClientError;
 use crate::llm::{ChatCompletionOptions, prompts};
+use crate::logging::StagehandLogger;
 use crate::page::StagehandPage;
 use crate::runtime::ChromiumoxideRuntime;
 use crate::types::page::{
@@ -314,81 +317,183 @@ pub async fn extract_local(
         inject_urls(&mut data, &tree.id_to_url);
     }
 
-    let data = coerce_extract_data(data, options.schema_definition.as_ref());
+    let data = coerce_extract_data(data, options.schema_definition.as_ref(), logger.as_ref());
 
     Ok(ExtractResult { data: Some(data) })
 }
 
 pub async fn act_local(
     page: &StagehandPage<'_, Arc<ChromiumoxideRuntime>>,
-    mut options: ActOptions,
+    options: ActOptions,
 ) -> Result<ActResult, StagehandClientError> {
     page.ensure_injection().await?;
 
-    let timeout = options
+    let mut current_options = options;
+    let original_options = current_options.clone();
+    let original_action = original_options.action.clone();
+
+    let timeout = current_options
         .dom_settle_timeout_ms
         .or(page.client().config().dom_settle_timeout_ms);
 
     let logger = page.client().logger();
-    logger.info(
-        format!("Starting action for task: '{}'", options.action),
-        Some("act"),
-        None,
-    );
-
-    let prompt = prompts::build_act_observe_prompt(
-        &options.action,
-        prompts::SUPPORTED_ACTIONS,
-        options.variables.as_ref(),
-    );
-
-    let observe_options = ObserveOptions {
-        instruction: prompt,
-        model_name: options.model_name.clone(),
-        draw_overlay: Some(false),
-        dom_settle_timeout_ms: options.dom_settle_timeout_ms,
-        model_client_options: options.model_client_options.take(),
+    let max_attempts = if page.client().config().self_heal {
+        2
+    } else {
+        1
     };
+    let mut attempt = 0usize;
 
-    let mut results = observe_local(page, observe_options, true).await?;
+    loop {
+        if attempt == 0 {
+            logger.info(
+                format!(
+                    "Starting action for task: '{}'",
+                    current_options.action.as_str()
+                ),
+                Some("act"),
+                None,
+            );
+        } else {
+            logger.info(
+                format!(
+                    "Self-heal attempt {} for task: '{}'",
+                    attempt + 1,
+                    current_options.action.as_str()
+                ),
+                Some("act"),
+                None,
+            );
+        }
 
-    if results.is_empty() {
-        return Ok(ActResult {
-            success: false,
-            message: "No observe results found for action".to_string(),
-            action: options.action,
-        });
-    }
+        let prompt = prompts::build_act_observe_prompt(
+            &current_options.action,
+            prompts::SUPPORTED_ACTIONS,
+            current_options.variables.as_ref(),
+        );
 
-    let mut selected = results.remove(0);
-    if let Some(vars) = options.variables.as_ref() {
-        if let Some(arguments) = selected.arguments.as_mut() {
-            *arguments = substitute_variables(arguments, vars);
+        let observe_options = ObserveOptions {
+            instruction: prompt,
+            model_name: current_options.model_name.clone(),
+            draw_overlay: Some(false),
+            dom_settle_timeout_ms: current_options.dom_settle_timeout_ms,
+            model_client_options: current_options.model_client_options.clone(),
+        };
+
+        let mut results = observe_local(page, observe_options, true).await?;
+
+        if results.is_empty() {
+            return Ok(ActResult {
+                success: false,
+                message: "No observe results found for action".to_string(),
+                action: original_action.clone(),
+            });
+        }
+
+        let mut selected = results.remove(0);
+        if let Some(vars) = current_options.variables.as_ref() {
+            if let Some(arguments) = selected.arguments.as_mut() {
+                *arguments = substitute_variables(arguments, vars);
+            }
+        }
+
+        let navigation_snapshot = match capture_navigation_snapshot(page).await {
+            Ok(snapshot) => Some(snapshot),
+            Err(err) => {
+                logger.debug(
+                    format!("Failed to capture navigation snapshot: {err}"),
+                    Some("act"),
+                    None,
+                );
+                None
+            }
+        };
+
+        let method_label = selected
+            .method
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string());
+
+        match perform_action(page, &selected).await {
+            Ok(_) => {
+                handle_navigation_after_action(
+                    page,
+                    navigation_snapshot.as_ref(),
+                    timeout,
+                    &method_label,
+                    &selected.selector,
+                )
+                .await;
+
+                let action_description = if selected.description.trim().is_empty() {
+                    "observe action".to_string()
+                } else {
+                    selected.description.clone()
+                };
+
+                return Ok(ActResult {
+                    success: true,
+                    message: format!(
+                        "Action [{}] performed successfully on selector: {}",
+                        method_label, selected.selector
+                    ),
+                    action: action_description,
+                });
+            }
+            Err(err) => {
+                if attempt + 1 >= max_attempts {
+                    return Ok(ActResult {
+                        success: false,
+                        message: format!("Failed to perform act: {err}"),
+                        action: original_action.clone(),
+                    });
+                }
+
+                let Some(fallback_command) = build_self_heal_command(&selected) else {
+                    logger.error(
+                        "Self-heal attempt aborted: could not construct a fallback command",
+                        Some("act"),
+                        None,
+                    );
+                    return Ok(ActResult {
+                        success: false,
+                        message: format!("Failed to perform act: {err}"),
+                        action: original_action.clone(),
+                    });
+                };
+
+                if original_action
+                    .trim()
+                    .eq_ignore_ascii_case(fallback_command.trim())
+                {
+                    logger.error(
+                        "Self-heal attempt aborted: fallback command matches original action",
+                        Some("act"),
+                        None,
+                    );
+                    return Ok(ActResult {
+                        success: false,
+                        message: format!("Failed to perform act: {err}"),
+                        action: original_action.clone(),
+                    });
+                }
+
+                logger.info(
+                    format!("Attempting self-heal with command: '{fallback_command}'"),
+                    Some("act"),
+                    None,
+                );
+
+                current_options = ActOptions {
+                    action: fallback_command,
+                    variables: None,
+                    ..original_options.clone()
+                };
+                attempt += 1;
+                continue;
+            }
         }
     }
-
-    perform_action(page, &selected).await?;
-
-    page.wait_for_settled_dom(timeout).await?;
-
-    let action_description = if selected.description.trim().is_empty() {
-        "observe action".to_string()
-    } else {
-        selected.description.clone()
-    };
-
-    Ok(ActResult {
-        success: true,
-        message: format!(
-            "Action [{}] performed successfully on selector: {}",
-            selected
-                .method
-                .clone()
-                .unwrap_or_else(|| "unknown".to_string()),
-            selected.selector
-        ),
-        action: action_description,
-    })
 }
 
 fn build_extract_response_format(schema: Option<&JsonValue>) -> Option<ResponseFormat> {
@@ -441,15 +546,251 @@ fn replace_with_url(value: &mut JsonValue, id_to_url: &HashMap<String, String>) 
     }
 }
 
-fn coerce_extract_data(data: JsonValue, schema: Option<&JsonValue>) -> JsonValue {
-    if schema.is_some() {
-        return data;
+fn coerce_extract_data(
+    data: JsonValue,
+    schema: Option<&JsonValue>,
+    logger: &StagehandLogger,
+) -> JsonValue {
+    if let Some(schema_value) = schema {
+        match validate_against_schema(schema_value, &data) {
+            Ok(()) => data,
+            Err(first_error) => {
+                logger.debug(
+                    format!("Schema validation failed for extract data: {first_error}"),
+                    Some("extract"),
+                    None,
+                );
+
+                let normalized = convert_keys_to_snake_case(&data);
+                match validate_against_schema(schema_value, &normalized) {
+                    Ok(()) => {
+                        logger.debug(
+                            "Schema validation succeeded after camelCase normalization",
+                            Some("extract"),
+                            None,
+                        );
+                        normalized
+                    }
+                    Err(second_error) => {
+                        logger.error(
+                            format!(
+                                "Failed to validate extract data against schema: {first_error}. Normalization retry also failed: {second_error}. Returning raw data."
+                            ),
+                            Some("extract"),
+                            None,
+                        );
+                        data
+                    }
+                }
+            }
+        }
+    } else {
+        match serde_json::from_value::<DefaultExtractSchema>(data.clone()) {
+            Ok(model) => serde_json::to_value(model).unwrap_or(data),
+            Err(_) => data,
+        }
+    }
+}
+
+#[derive(Default)]
+struct NavigationSnapshot {
+    url: Option<String>,
+    page_ids: HashSet<String>,
+}
+
+async fn capture_navigation_snapshot(
+    page: &StagehandPage<'_, Arc<ChromiumoxideRuntime>>,
+) -> Result<NavigationSnapshot, StagehandClientError> {
+    let url_value = page
+        .evaluate_expression("(() => window.location.href || '')()")
+        .await?;
+    let current_url = url_value
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string());
+
+    let page_ids = page
+        .client()
+        .browser()
+        .runtime()
+        .list_pages()
+        .await
+        .map_err(StagehandClientError::Browser)?
+        .into_iter()
+        .collect::<HashSet<_>>();
+
+    Ok(NavigationSnapshot {
+        url: current_url,
+        page_ids,
+    })
+}
+
+async fn handle_navigation_after_action(
+    page: &StagehandPage<'_, Arc<ChromiumoxideRuntime>>,
+    before: Option<&NavigationSnapshot>,
+    timeout_ms: Option<u64>,
+    method: &str,
+    selector: &str,
+) {
+    let logger = page.client().logger();
+    logger.info(
+        format!("{method} action complete; checking for navigation"),
+        Some("act"),
+        Some(json!({ "selector": selector })),
+    );
+
+    if let Err(err) = page.wait_for_settled_dom(timeout_ms).await {
+        logger.debug(
+            format!("wait_for_settled_dom hit an error after {method}: {err}"),
+            Some("act"),
+            None,
+        );
     }
 
-    match serde_json::from_value::<DefaultExtractSchema>(data.clone()) {
-        Ok(model) => serde_json::to_value(model).unwrap_or(data),
-        Err(_) => data,
+    let Some(previous) = before else {
+        return;
+    };
+
+    let after = match capture_navigation_snapshot(page).await {
+        Ok(snapshot) => snapshot,
+        Err(err) => {
+            logger.debug(
+                format!("Failed to capture post-action navigation snapshot: {err}"),
+                Some("act"),
+                None,
+            );
+            return;
+        }
+    };
+
+    if previous.url != after.url {
+        if let Some(url) = after.url.as_ref() {
+            logger.info(
+                format!("Navigation detected after {method}: {url}"),
+                Some("act"),
+                Some(json!({ "selector": selector })),
+            );
+        }
     }
+
+    let new_pages: Vec<_> = after
+        .page_ids
+        .difference(&previous.page_ids)
+        .cloned()
+        .collect();
+
+    for page_id in new_pages {
+        logger.info(
+            format!("New page detected after {method}: {page_id}"),
+            Some("act"),
+            None,
+        );
+
+        if let Err(err) = page.client().ensure_page_ready(page_id.clone(), None).await {
+            logger.error(
+                format!("Failed to register new page {page_id}: {err}"),
+                Some("act"),
+                None,
+            );
+        }
+    }
+}
+
+fn build_self_heal_command(result: &ObserveResult) -> Option<String> {
+    let method = result.method.as_deref().unwrap_or("").trim();
+    let description = result.description.trim();
+
+    if method.is_empty() && description.is_empty() {
+        return None;
+    }
+
+    if !method.is_empty()
+        && !description.is_empty()
+        && description
+            .to_ascii_lowercase()
+            .starts_with(&method.to_ascii_lowercase())
+    {
+        return Some(description.to_string());
+    }
+
+    if !method.is_empty() {
+        let combined = format!("{method} {description}").trim().to_string();
+        if !combined.is_empty() {
+            return Some(combined);
+        }
+    }
+
+    if !description.is_empty() {
+        return Some(description.to_string());
+    }
+
+    None
+}
+
+fn validate_against_schema(schema: &JsonValue, data: &JsonValue) -> Result<(), String> {
+    let compiled = JSONSchema::compile(schema).map_err(|err| err.to_string())?;
+    if let Err(errors) = compiled.validate(data) {
+        let joined = errors
+            .map(|issue| issue.to_string())
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(joined);
+    }
+    Ok(())
+}
+
+fn convert_keys_to_snake_case(value: &JsonValue) -> JsonValue {
+    match value {
+        JsonValue::Object(map) => {
+            let mut converted = serde_json::Map::with_capacity(map.len());
+            for (key, val) in map {
+                let normalized_key = camel_to_snake_case(key);
+                converted.insert(normalized_key, convert_keys_to_snake_case(val));
+            }
+            JsonValue::Object(converted)
+        }
+        JsonValue::Array(items) => JsonValue::Array(
+            items
+                .iter()
+                .map(|item| convert_keys_to_snake_case(item))
+                .collect(),
+        ),
+        _ => value.clone(),
+    }
+}
+
+fn camel_to_snake_case(input: &str) -> String {
+    let mut result = String::new();
+    let mut prev: Option<char> = None;
+    let mut chars = input.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch.is_ascii_uppercase() {
+            let next_is_lowercase = chars
+                .peek()
+                .map(|next| next.is_ascii_lowercase())
+                .unwrap_or(false);
+            let prev_is_lowercase_or_digit = prev
+                .map(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+                .unwrap_or(false);
+
+            if !result.is_empty() && (prev_is_lowercase_or_digit || next_is_lowercase) {
+                if !result.ends_with('_') {
+                    result.push('_');
+                }
+            }
+            result.push(ch.to_ascii_lowercase());
+        } else if ch == '-' {
+            if !result.ends_with('_') {
+                result.push('_');
+            }
+        } else {
+            result.push(ch);
+        }
+        prev = Some(ch);
+    }
+
+    result
 }
 
 fn substitute_variables(args: &[String], variables: &HashMap<String, String>) -> Vec<String> {
@@ -780,6 +1121,7 @@ async fn select_option_from_dropdown(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Verbosity;
 
     #[test]
     fn substitute_variables_replaces_tokens() {
@@ -834,6 +1176,70 @@ mod tests {
         assert_eq!(
             value["nested"]["items"][0]["linkUrl"],
             JsonValue::String("https://example.com/inner".to_string())
+        );
+    }
+
+    #[test]
+    fn build_self_heal_command_prefers_existing_description() {
+        let result = ObserveResult {
+            selector: "xpath=//button".to_string(),
+            description: "click Submit button".to_string(),
+            backend_node_id: Some(1),
+            method: Some("click".to_string()),
+            arguments: None,
+        };
+
+        let command = build_self_heal_command(&result);
+        assert_eq!(command.as_deref(), Some("click Submit button"));
+    }
+
+    #[test]
+    fn convert_keys_to_snake_case_handles_nested_objects() {
+        let value = json!({
+            "companyName": "Stagehand",
+            "details": {
+                "headquartersCity": "San Francisco"
+            },
+            "items": [
+                { "externalUrl": "1" }
+            ]
+        });
+
+        let normalized = convert_keys_to_snake_case(&value);
+        assert!(normalized.get("company_name").is_some());
+        assert!(
+            normalized
+                .get("details")
+                .and_then(|details| details.get("headquarters_city"))
+                .is_some()
+        );
+        assert!(
+            normalized
+                .get("items")
+                .and_then(|items| items.get(0))
+                .and_then(|item| item.get("external_url"))
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn coerce_extract_data_normalizes_and_validates_against_schema() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "company_name": { "type": "string" }
+            },
+            "required": ["company_name"],
+            "additionalProperties": false
+        });
+
+        let logger = StagehandLogger::new(Verbosity::Detailed);
+        let input = json!({ "companyName": "Stagehand" });
+        let result = coerce_extract_data(input, Some(&schema), &logger);
+
+        assert_eq!(
+            result["company_name"],
+            JsonValue::String("Stagehand".to_string())
         );
     }
 }

@@ -3,8 +3,11 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use futures_util::future::join_all;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
+
+use chromiumoxide_types::{Command as CdpCommand, Method as CdpMethod, MethodId, MethodType};
 
 use crate::logging::StagehandLogger;
 use crate::types::{AccessibilityNode, AxNode, AxValue, TreeResult};
@@ -21,6 +24,43 @@ pub enum AccessibilityError {
     Serialization(#[from] serde_json::Error),
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub(crate) struct GetFullAxTreeCommand {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub depth: Option<i64>,
+    #[serde(rename = "frameId", skip_serializing_if = "Option::is_none")]
+    pub frame_id: Option<String>,
+}
+
+impl GetFullAxTreeCommand {
+    pub const IDENTIFIER: &'static str = "Accessibility.getFullAXTree";
+}
+
+impl CdpMethod for GetFullAxTreeCommand {
+    fn identifier(&self) -> MethodId {
+        Self::IDENTIFIER.into()
+    }
+}
+
+impl MethodType for GetFullAxTreeCommand {
+    fn method_id() -> MethodId
+    where
+        Self: Sized,
+    {
+        Self::IDENTIFIER.into()
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub(crate) struct GetFullAxTreeResponse {
+    #[serde(default)]
+    pub nodes: Vec<AxNode>,
+}
+
+impl CdpCommand for GetFullAxTreeCommand {
+    type Response = GetFullAxTreeResponse;
+}
+
 #[async_trait]
 pub trait AccessibilityPage: Send + Sync {
     async fn ensure_injection(&self) -> Result<(), AccessibilityError>;
@@ -32,6 +72,8 @@ pub trait AccessibilityPage: Send + Sync {
         method: &str,
         params: Option<Value>,
     ) -> Result<Value, AccessibilityError>;
+
+    async fn enable_cdp_domain(&self, domain: &str) -> Result<(), AccessibilityError>;
 
     async fn disable_cdp_domain(&self, domain: &str) -> Result<(), AccessibilityError>;
 
@@ -500,6 +542,16 @@ pub async fn get_accessibility_tree<P: AccessibilityPage + ?Sized>(
 ) -> Result<TreeResult, AccessibilityError> {
     let start = Instant::now();
 
+    for domain in ["Page", "DOM", "Accessibility"] {
+        if let Err(err) = page.enable_cdp_domain(domain).await {
+            logger.debug(
+                format!("Failed to enable {domain} domain before accessibility fetch: {err}"),
+                Some("a11y"),
+                None,
+            );
+        }
+    }
+
     let result: Result<(TreeResult, Duration), AccessibilityError> = async {
         let scrollable_backend_ids = find_scrollable_element_ids(page, Some(logger)).await;
 
@@ -887,6 +939,10 @@ mod tests {
             } else {
                 Ok(Value::Null)
             }
+        }
+
+        async fn enable_cdp_domain(&self, _: &str) -> Result<(), AccessibilityError> {
+            Ok(())
         }
 
         async fn disable_cdp_domain(&self, _: &str) -> Result<(), AccessibilityError> {

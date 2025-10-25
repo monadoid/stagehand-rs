@@ -10,4 +10,5 @@ pub mod logging;
 pub mod metrics;
 pub mod page;
 pub mod runtime;
+pub mod stagehand;
 pub mod types;
