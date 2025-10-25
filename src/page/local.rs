@@ -27,6 +27,40 @@ fn map_accessibility_error(err: AccessibilityError) -> StagehandClientError {
     StagehandClientError::Cdp(err.to_string())
 }
 
+fn observe_response_format() -> ResponseFormat {
+    ResponseFormat::JsonSchema {
+        json_schema: ResponseFormatJsonSchema {
+            description: None,
+            name: "observe_inference".to_string(),
+            schema: Some(json!({
+                "type": "object",
+                "properties": {
+                    "elements": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "element_id": { "type": "integer" },
+                                "description": { "type": "string" },
+                                "method": { "type": "string" },
+                                "arguments": {
+                                    "type": "array",
+                                    "items": { "type": "string" }
+                                }
+                            },
+                            "required": ["element_id", "description", "method", "arguments"],
+                            "additionalProperties": false
+                        }
+                    }
+                },
+                "required": ["elements"],
+                "additionalProperties": false
+            })),
+            strict: Some(false),
+        },
+    }
+}
+
 pub async fn observe_local(
     page: &StagehandPage<'_, Arc<ChromiumoxideRuntime>>,
     mut options: ObserveOptions,
@@ -76,7 +110,8 @@ pub async fn observe_local(
 
     let mut chat_options = ChatCompletionOptions::default();
     chat_options.model = options.model_name.clone();
-    chat_options.response_format = Some(ResponseFormat::JsonObject);
+    chat_options.temperature = Some(0.1);
+    chat_options.response_format = Some(observe_response_format());
     chat_options.metadata = options.model_client_options.take();
 
     let llm = page.client().create_llm_client()?;
@@ -274,6 +309,7 @@ pub async fn extract_local(
     let mut chat_options = ChatCompletionOptions::default();
     chat_options.model = options.model_name.clone();
     chat_options.metadata = options.model_client_options.take();
+    chat_options.temperature = Some(0.1);
 
     chat_options.response_format =
         build_extract_response_format(options.schema_definition.as_ref())
