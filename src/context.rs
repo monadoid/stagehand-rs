@@ -124,6 +124,11 @@ impl StagehandContext {
         self.pages.get(page_id)
     }
 
+    /// Iterate over registered page identifiers.
+    pub fn page_ids(&self) -> impl Iterator<Item = &PageId> {
+        self.pages.keys()
+    }
+
     /// Update the active page and inform the adapter.
     pub fn set_active_page(&mut self, page_id: &PageId) -> Result<(), StagehandContextError> {
         if !self.pages.contains_key(page_id) {
@@ -141,6 +146,10 @@ impl StagehandContext {
         self.active_page
             .as_ref()
             .and_then(|page_id| self.pages.get(page_id))
+    }
+
+    pub fn active_page_id(&self) -> Option<&PageId> {
+        self.active_page.as_ref()
     }
 
     /// Register a frame identifier for a page and update the index accordingly.

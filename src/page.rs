@@ -19,6 +19,7 @@ use chromiumoxide::cdp::browser_protocol::{
     },
     page as page_domain,
     page::EventFrameStoppedLoading,
+    target::{FilterEntry, SetAutoAttachParams, TargetFilter},
 };
 use chromiumoxide::cdp::js_protocol::runtime::{CallFunctionOnParams, EvaluateParams};
 use chromiumoxide::listeners::EventStream;
@@ -279,6 +280,32 @@ impl<'client> StagehandPage<'client, Arc<ChromiumoxideRuntime>> {
         Ok(())
     }
 
+    async fn configure_target_auto_attach(&self) -> Result<(), StagehandClientError> {
+        let page = self.chromium_page().await?;
+
+        let worker_filter = TargetFilter::new(vec![
+            FilterEntry::builder()
+                .r#type("worker")
+                .exclude(true)
+                .build(),
+            FilterEntry::builder()
+                .r#type("shared_worker")
+                .exclude(true)
+                .build(),
+        ]);
+
+        let command = SetAutoAttachParams::builder()
+            .auto_attach(true)
+            .wait_for_debugger_on_start(false)
+            .flatten(true)
+            .filter(worker_filter)
+            .build()
+            .map_err(|err| StagehandClientError::Cdp(err))?;
+
+        page.execute(command).await.map_err(cdp_error)?;
+        Ok(())
+    }
+
     pub async fn enable_cdp_domain(&self, domain: &str) -> Result<(), StagehandClientError> {
         let page = self.chromium_page().await?;
         match domain {
@@ -362,6 +389,14 @@ impl<'client> StagehandPage<'client, Arc<ChromiumoxideRuntime>> {
                     None,
                 );
             }
+        }
+
+        if let Err(err) = self.configure_target_auto_attach().await {
+            logger.debug(
+                format!("Failed to configure Target.setAutoAttach: {err}"),
+                Some("dom-settle"),
+                None,
+            );
         }
 
         let page = self.chromium_page().await?;

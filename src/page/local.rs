@@ -722,9 +722,28 @@ async fn handle_navigation_after_action(
             None,
         );
 
+        let lock = page.client().page_switch_lock();
+        let _guard = lock.lock().await;
+
         if let Err(err) = page.client().ensure_page_ready(page_id.clone(), None).await {
             logger.error(
                 format!("Failed to register new page {page_id}: {err}"),
+                Some("act"),
+                None,
+            );
+        } else if let Err(err) = page
+            .client()
+            .with_context(|ctx| {
+                let page_id = page_id.clone();
+                Box::pin(async move {
+                    ctx.set_active_page(&page_id)?;
+                    Ok(())
+                })
+            })
+            .await
+        {
+            logger.error(
+                format!("Failed to set active page after {method}: {err}"),
                 Some("act"),
                 None,
             );

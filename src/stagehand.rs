@@ -6,8 +6,6 @@
 
 use std::sync::Arc;
 
-use tokio::sync::Mutex;
-
 use crate::browser::{BrowserError, BrowserRuntime};
 use crate::client::{StagehandClient, StagehandClientError};
 use crate::config::StagehandConfig;
@@ -26,7 +24,6 @@ pub enum StagehandError {
 /// High-level Stagehand wrapper that mirrors the Python `Stagehand` class.
 pub struct Stagehand<R: BrowserRuntime> {
     client: StagehandClient<R>,
-    active_page: Mutex<Option<String>>,
 }
 
 impl Stagehand<Arc<ChromiumoxideRuntime>> {
@@ -44,10 +41,7 @@ impl Stagehand<Arc<ChromiumoxideRuntime>> {
 impl<R: BrowserRuntime + 'static> Stagehand<R> {
     /// Wrap an existing [`StagehandClient`] in the high-level facade.
     pub fn from_client(client: StagehandClient<R>) -> Self {
-        Self {
-            client,
-            active_page: Mutex::new(None),
-        }
+        Self { client }
     }
 
     /// Access the underlying client for advanced operations.
@@ -63,21 +57,12 @@ impl<R: BrowserRuntime + 'static> Stagehand<R> {
     /// Open a page, mark it active, and return a [`StagehandPage`] handle.
     pub async fn open_page(&self, url: &str) -> Result<StagehandPage<'_, R>, StagehandClientError> {
         let page_id = self.client.open_page(url).await?;
-        {
-            let mut guard = self.active_page.lock().await;
-            *guard = Some(page_id.clone());
-        }
         Ok(self.client.page(page_id))
     }
 
     /// Retrieve the currently active page, returning an error if none is set.
     pub async fn page(&self) -> Result<StagehandPage<'_, R>, StagehandClientError> {
-        let page_id = {
-            let guard = self.active_page.lock().await;
-            guard.clone()
-        };
-
-        match page_id {
+        match self.client.active_page_id().await? {
             Some(id) => Ok(self.client.page(id)),
             None => Err(StagehandClientError::Unsupported(
                 "no active page; open a page first",
@@ -86,9 +71,8 @@ impl<R: BrowserRuntime + 'static> Stagehand<R> {
     }
 
     /// Manually set the active page identifier.
-    pub async fn set_active_page(&self, page_id: String) {
-        let mut guard = self.active_page.lock().await;
-        *guard = Some(page_id);
+    pub async fn set_active_page(&self, page_id: String) -> Result<(), StagehandClientError> {
+        self.client.set_active_page(&page_id).await
     }
 
     /// Navigate the active page to the provided URL.
@@ -101,7 +85,7 @@ impl<R: BrowserRuntime + 'static> Stagehand<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::browser::{BrowserRuntimeError, BrowserbasePlan, LocalPlan};
+    use crate::browser::{BrowserRuntimeError, BrowserbasePlan, LocalPlan, RuntimeTargetEvent};
     use crate::client::{HttpResponse, StagehandClientError, StagehandHttp, StreamingHttpResponse};
     use crate::config::{Environment, StagehandConfig};
     use crate::context::{StagehandAdapter, StagehandAdapterError};
@@ -109,6 +93,8 @@ mod tests {
     use async_trait::async_trait;
     use std::collections::HashMap;
     use std::sync::Mutex as StdMutex;
+    use tokio::sync::Mutex;
+    use tokio::sync::Mutex;
 
     #[derive(Default)]
     struct MockRuntime {
@@ -143,6 +129,15 @@ mod tests {
 
         async fn list_pages(&self) -> Result<Vec<String>, BrowserRuntimeError> {
             Ok(self.pages.lock().await.keys().cloned().collect())
+        }
+
+        async fn target_event_stream(
+            &self,
+        ) -> Result<tokio::sync::broadcast::Receiver<RuntimeTargetEvent>, BrowserRuntimeError>
+        {
+            Err(BrowserRuntimeError::Unsupported(
+                "mock runtime does not support target events".into(),
+            ))
         }
     }
 

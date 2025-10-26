@@ -4,6 +4,7 @@
 //! logic with the `StagehandContext` wrapper, providing a stub implementation
 //! that we can grow towards the full Python feature set.
 
+use std::collections::HashSet;
 use std::io;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -16,12 +17,13 @@ use reqwest::Client as HttpClient;
 use reqwest::header::{CONNECTION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde_json::{Map as JsonMap, Value as JsonValue, json};
 use thiserror::Error;
-use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::{Mutex as AsyncMutex, broadcast, broadcast::error::TryRecvError};
 use tokio_util::codec::{FramedRead, LinesCodec};
 use tokio_util::io::StreamReader;
 
 use crate::browser::{
-    BrowserError, BrowserPlan, BrowserRuntime, BrowserRuntimeError, StagehandBrowser,
+    BrowserError, BrowserPlan, BrowserRuntime, BrowserRuntimeError, RuntimeTargetEvent,
+    StagehandBrowser,
 };
 use crate::config::{Environment, LoggerCallback, StagehandConfig};
 use crate::context::{StagehandAdapter, StagehandContext, StagehandContextError};
@@ -177,6 +179,8 @@ pub struct StagehandClient<R: BrowserRuntime> {
     metrics: Arc<Mutex<StagehandMetrics>>,
     http_client: Arc<dyn StagehandHttp>,
     api_state: AsyncMutex<ApiSessionState>,
+    target_events: AsyncMutex<Option<broadcast::Receiver<RuntimeTargetEvent>>>,
+    page_switch_lock: Arc<AsyncMutex<()>>,
     llm_factory: Arc<
         dyn Fn(
                 &StagehandClient<R>,
@@ -307,6 +311,8 @@ impl<R: BrowserRuntime + 'static> StagehandClient<R> {
             metrics,
             http_client,
             api_state: AsyncMutex::new(ApiSessionState::default()),
+            target_events: AsyncMutex::new(None),
+            page_switch_lock: Arc::new(AsyncMutex::new(())),
             llm_factory: default_llm_factory(),
         })
     }
@@ -321,6 +327,10 @@ impl<R: BrowserRuntime + 'static> StagehandClient<R> {
 
     pub fn session_lock(&self) -> &AsyncMutex<()> {
         &self.session_lock
+    }
+
+    pub fn page_switch_lock(&self) -> Arc<AsyncMutex<()>> {
+        Arc::clone(&self.page_switch_lock)
     }
 
     pub fn log_debug(&self, message: &str, category: &'static str) {
@@ -461,6 +471,9 @@ impl<R: BrowserRuntime + 'static> StagehandClient<R> {
             }
         }
 
+        drop(guard);
+        self.ensure_target_event_receiver().await?;
+
         Ok(())
     }
 
@@ -476,7 +489,124 @@ impl<R: BrowserRuntime + 'static> StagehandClient<R> {
         let ctx = guard
             .as_mut()
             .expect("context must be initialized after ensure_initialized");
+        self.sync_context_pages_locked(ctx).await?;
         f(ctx).await.map_err(StagehandClientError::Context)
+    }
+
+    async fn sync_context_pages_locked(
+        &self,
+        ctx: &mut StagehandContext,
+    ) -> Result<(), StagehandClientError> {
+        self.ensure_target_event_receiver().await?;
+        self.drain_target_events(ctx).await?;
+
+        let runtime_pages: Vec<String> = self
+            .browser
+            .runtime()
+            .list_pages()
+            .await
+            .map_err(StagehandClientError::Browser)?;
+        let runtime_set: HashSet<String> = runtime_pages.iter().cloned().collect();
+
+        let existing_pages: Vec<String> = ctx.page_ids().cloned().collect();
+
+        for page_id in existing_pages {
+            if !runtime_set.contains(&page_id) {
+                ctx.remove_page(&page_id);
+            }
+        }
+
+        for page_id in &runtime_pages {
+            if ctx.page(page_id).is_none() {
+                ctx.register_page(page_id.clone(), None);
+                ctx.ensure_dom_script(page_id).await?;
+                if ctx.active_page_id().is_none() {
+                    if let Err(err) = ctx.set_active_page(page_id) {
+                        self.log_error(
+                            &format!("Failed to set active page to {page_id}: {err}"),
+                            "context",
+                        );
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn ensure_target_event_receiver(&self) -> Result<(), StagehandClientError> {
+        let mut guard = self.target_events.lock().await;
+        if guard.is_none() {
+            match self.browser.runtime().target_event_stream().await {
+                Ok(receiver) => {
+                    *guard = Some(receiver);
+                }
+                Err(BrowserRuntimeError::Unsupported(_)) => {}
+                Err(BrowserRuntimeError::NotInitialized) => {}
+                Err(err) => return Err(StagehandClientError::Browser(err)),
+            }
+        }
+        Ok(())
+    }
+
+    async fn drain_target_events(
+        &self,
+        ctx: &mut StagehandContext,
+    ) -> Result<(), StagehandClientError> {
+        let mut guard = self.target_events.lock().await;
+        let mut pending = Vec::new();
+        if let Some(receiver) = guard.as_mut() {
+            loop {
+                match receiver.try_recv() {
+                    Ok(event) => pending.push(event),
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Lagged(_)) => continue,
+                    Err(TryRecvError::Closed) => {
+                        *guard = None;
+                        break;
+                    }
+                }
+            }
+        }
+        drop(guard);
+
+        if pending.is_empty() {
+            return Ok(());
+        }
+
+        let lock = self.page_switch_lock();
+        let _guard = lock.lock().await;
+
+        for event in pending {
+            match event {
+                RuntimeTargetEvent::Attached { target_id } => {
+                    ctx.register_page(target_id.clone(), None);
+                    ctx.ensure_dom_script(&target_id).await?;
+                    if let Err(err) = ctx.set_active_page(&target_id) {
+                        self.log_error(
+                            &format!("Failed to set active page to {target_id}: {err}"),
+                            "context",
+                        );
+                    }
+                }
+                RuntimeTargetEvent::Detached { target_id } => {
+                    let was_removed = ctx.remove_page(&target_id);
+                    if was_removed && ctx.active_page_id().is_none() {
+                        let next_page = ctx.page_ids().next().cloned();
+                        if let Some(first) = next_page {
+                            if let Err(err) = ctx.set_active_page(&first) {
+                                self.log_error(
+                                    &format!("Failed to set active page to {first}: {err}"),
+                                    "context",
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
     }
 
     /// Register a page and ensure the Stagehand DOM script has been injected.
@@ -498,9 +628,31 @@ impl<R: BrowserRuntime + 'static> StagehandClient<R> {
         .await
     }
 
+    pub async fn set_active_page(&self, page_id: &str) -> Result<(), StagehandClientError> {
+        let page_id = page_id.to_string();
+        self.with_context(|ctx| {
+            let page_id = page_id.clone();
+            Box::pin(async move {
+                ctx.set_active_page(&page_id)?;
+                Ok(())
+            })
+        })
+        .await
+    }
+
+    pub async fn active_page_id(&self) -> Result<Option<String>, StagehandClientError> {
+        self.with_context(|ctx| {
+            let active = ctx.active_page_id().cloned();
+            Box::pin(async move { Ok(active) })
+        })
+        .await
+    }
+
     /// Open a new page using the underlying browser runtime and ensure it is registered.
     pub async fn open_page(&self, url: &str) -> Result<String, StagehandClientError> {
         self.ensure_initialized().await?;
+        let lock = self.page_switch_lock();
+        let _guard = lock.lock().await;
         let page_id = self.browser.runtime().new_page(url).await?;
         self.ensure_page_ready(page_id.clone(), None).await?;
         self.with_context(|ctx| {

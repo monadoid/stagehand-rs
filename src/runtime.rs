@@ -5,7 +5,7 @@
 //! launches and exposes helpers to open pages and fetch their content so higher
 //! level components (e.g. `StagehandClient`) can drive real CDP interactions.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::convert::TryFrom;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -18,27 +18,35 @@ use chromiumoxide::{
 use futures_util::StreamExt;
 use reqwest::Client as HttpClient;
 use serde::Deserialize;
-use tokio::{fs, sync::Mutex, task::JoinHandle};
+use tokio::{
+    fs,
+    sync::{Mutex, broadcast},
+    task::JoinHandle,
+};
 
 use crate::browser::{
     BrowserRuntime, BrowserRuntimeError, BrowserbasePlan, BrowserbaseSessionCreateParams,
-    BrowserbaseSessionStrategy, LocalLaunchStrategy, LocalPlan,
+    BrowserbaseSessionStrategy, LocalLaunchStrategy, LocalPlan, RuntimeTargetEvent,
 };
 
 const DEFAULT_BROWSERBASE_API_URL: &str = "https://api.browserbase.com/v1";
 
 #[derive(Default)]
 pub struct ChromiumoxideRuntime {
-    state: Mutex<Option<RuntimeState>>,
+    state: Arc<Mutex<Option<RuntimeState>>>,
 }
 
 struct RuntimeState {
     browser: Arc<Browser>,
     _handler: JoinHandle<()>,
     pages: HashMap<String, ChromiumPage>,
+    session_targets: HashMap<String, String>,
     remote: Option<BrowserbaseRuntimeState>,
     #[allow(dead_code)]
     temp_user_data_dir: Option<PathBuf>,
+    #[allow(dead_code)]
+    target_listener: Option<JoinHandle<()>>,
+    target_events: broadcast::Sender<RuntimeTargetEvent>,
 }
 
 #[allow(dead_code)]
@@ -193,7 +201,7 @@ impl BrowserbaseApiClient {
 impl ChromiumoxideRuntime {
     pub fn new() -> Self {
         Self {
-            state: Mutex::new(None),
+            state: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -222,6 +230,113 @@ impl ChromiumoxideRuntime {
                 let id = page.target_id().as_ref().to_string();
                 state.pages.entry(id).or_insert(page);
             }
+        }
+
+        Ok(())
+    }
+
+    async fn ensure_target_monitor(&self) -> Result<(), BrowserRuntimeError> {
+        let (browser, already_running, event_sender) = {
+            let guard = self.state.lock().await;
+            let state = guard.as_ref().ok_or(BrowserRuntimeError::NotInitialized)?;
+            (
+                state.browser.clone(),
+                state.target_listener.is_some(),
+                state.target_events.clone(),
+            )
+        };
+
+        if already_running {
+            return Ok(());
+        }
+
+        let state_arc = Arc::clone(&self.state);
+
+        let mut attached_stream = browser
+            .event_listener::<chromiumoxide::cdp::browser_protocol::target::EventAttachedToTarget>()
+            .await
+            .map_err(map_chromiumoxide_error)?;
+        let mut detached_stream = browser
+            .event_listener::<chromiumoxide::cdp::browser_protocol::target::EventDetachedFromTarget>()
+            .await
+            .map_err(map_chromiumoxide_error)?;
+
+        let browser_for_pages = browser.clone();
+        let event_sender = event_sender.clone();
+        let monitor_handle = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    maybe_event = attached_stream.next() => {
+                        if let Some(event) = maybe_event {
+                            let event = (*event).clone();
+                            if event.target_info.r#type == "page" {
+                                let target_id = event.target_info.target_id.clone();
+                                let session_id = event.session_id.as_ref().to_string();
+                                match browser_for_pages.get_page(target_id.clone()).await {
+                                    Ok(page) => {
+                                        let mut guard = state_arc.lock().await;
+                                        if let Some(state) = guard.as_mut() {
+                                            let target_str = target_id.as_ref().to_string();
+                                            state.pages.insert(target_str.clone(), page);
+                                            state.session_targets.insert(session_id, target_str.clone());
+                                            let _ = event_sender.send(RuntimeTargetEvent::Attached { target_id: target_str });
+                                        }
+                                    }
+                                    Err(err) => {
+                                        eprintln!("chromiumoxide target listener failed to fetch page: {err}");
+                                    }
+                                }
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+                    maybe_event = detached_stream.next() => {
+                        if let Some(event) = maybe_event {
+                            let session_id = event.session_id.as_ref().to_string();
+                            let mut guard = state_arc.lock().await;
+                            if let Some(state) = guard.as_mut() {
+                                if let Some(target_id) = state.session_targets.remove(&session_id) {
+                                    state.pages.remove(&target_id);
+                                    let _ = event_sender.send(RuntimeTargetEvent::Detached { target_id });
+                                } else {
+                                    match browser_for_pages.pages().await {
+                                        Ok(pages) => {
+                                            let existing: HashSet<String> = pages
+                                                .into_iter()
+                                                .map(|page| page.target_id().as_ref().to_string())
+                                                .collect();
+                                            let stale: Vec<String> = state
+                                                .pages
+                                                .keys()
+                                                .filter(|id| !existing.contains(*id))
+                                                .cloned()
+                                                .collect();
+                                            for target_id in stale {
+                                                state.pages.remove(&target_id);
+                                                let _ = event_sender
+                                                    .send(RuntimeTargetEvent::Detached { target_id });
+                                            }
+                                        }
+                                        Err(err) => {
+                                            eprintln!(
+                                                "chromiumoxide target listener failed to refresh pages after detach: {err}"
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+
+        let mut guard = self.state.lock().await;
+        if let Some(state) = guard.as_mut() {
+            state.target_listener = Some(monitor_handle);
         }
 
         Ok(())
@@ -288,6 +403,7 @@ impl BrowserRuntime for ChromiumoxideRuntime {
         attach_to_cdp(&self.state, &remote_state.connect_url).await?;
         self.set_remote_state(remote_state).await?;
         self.populate_initial_pages().await?;
+        self.ensure_target_monitor().await?;
 
         Ok(())
     }
@@ -307,6 +423,7 @@ impl BrowserRuntime for ChromiumoxideRuntime {
         }
 
         self.populate_initial_pages().await?;
+        self.ensure_target_monitor().await?;
 
         Ok(())
     }
@@ -327,6 +444,9 @@ impl BrowserRuntime for ChromiumoxideRuntime {
         let mut guard = self.state.lock().await;
         if let Some(state) = guard.as_mut() {
             state.pages.insert(page_id.clone(), page);
+            let _ = state.target_events.send(RuntimeTargetEvent::Attached {
+                target_id: page_id.clone(),
+            });
         }
 
         Ok(page_id)
@@ -352,6 +472,15 @@ impl BrowserRuntime for ChromiumoxideRuntime {
         let state = guard.as_ref().ok_or(BrowserRuntimeError::NotInitialized)?;
         Ok(state.pages.keys().cloned().collect())
     }
+
+    async fn target_event_stream(
+        &self,
+    ) -> Result<broadcast::Receiver<RuntimeTargetEvent>, BrowserRuntimeError> {
+        self.ensure_target_monitor().await?;
+        let guard = self.state.lock().await;
+        let state = guard.as_ref().ok_or(BrowserRuntimeError::NotInitialized)?;
+        Ok(state.target_events.subscribe())
+    }
 }
 
 #[async_trait]
@@ -374,6 +503,12 @@ impl BrowserRuntime for Arc<ChromiumoxideRuntime> {
 
     async fn list_pages(&self) -> Result<Vec<String>, BrowserRuntimeError> {
         (**self).list_pages().await
+    }
+
+    async fn target_event_stream(
+        &self,
+    ) -> Result<broadcast::Receiver<RuntimeTargetEvent>, BrowserRuntimeError> {
+        (**self).target_event_stream().await
     }
 }
 
@@ -446,14 +581,18 @@ async fn attach_to_cdp(
 
     let browser = Arc::new(browser);
     let join = spawn_handler(handler);
+    let (event_tx, _) = broadcast::channel(32);
 
     let mut guard = state.lock().await;
     *guard = Some(RuntimeState {
         browser,
         _handler: join,
         pages: HashMap::new(),
+        session_targets: HashMap::new(),
         remote: None,
         temp_user_data_dir: None,
+        target_listener: None,
+        target_events: event_tx,
     });
 
     Ok(())
@@ -477,14 +616,18 @@ async fn launch_persistent(
 
     let browser = Arc::new(browser);
     let join = spawn_handler(handler);
+    let (event_tx, _) = broadcast::channel(32);
 
     let mut guard = state.lock().await;
     *guard = Some(RuntimeState {
         browser,
         _handler: join,
         pages: HashMap::new(),
+        session_targets: HashMap::new(),
         remote: None,
         temp_user_data_dir: None,
+        target_listener: None,
+        target_events: event_tx,
     });
 
     Ok(())

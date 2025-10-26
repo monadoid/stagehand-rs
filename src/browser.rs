@@ -170,6 +170,12 @@ pub struct LocalPlan {
     pub chrome_executable: Option<PathBuf>,
 }
 
+#[derive(Debug, Clone)]
+pub enum RuntimeTargetEvent {
+    Attached { target_id: String },
+    Detached { target_id: String },
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum LocalLaunchStrategy {
     AttachCdp {
@@ -193,6 +199,14 @@ pub trait BrowserRuntime: Send + Sync {
     async fn page_content(&self, page_id: &str) -> Result<Option<String>, BrowserRuntimeError>;
 
     async fn list_pages(&self) -> Result<Vec<String>, BrowserRuntimeError>;
+
+    async fn target_event_stream(
+        &self,
+    ) -> Result<tokio::sync::broadcast::Receiver<RuntimeTargetEvent>, BrowserRuntimeError> {
+        Err(BrowserRuntimeError::Unsupported(
+            "target event stream not supported".to_string(),
+        ))
+    }
 }
 
 #[derive(Debug, Error)]
@@ -201,6 +215,8 @@ pub enum BrowserRuntimeError {
     Message(String),
     #[error("browser runtime not initialized")]
     NotInitialized,
+    #[error("browser runtime feature unsupported: {0}")]
+    Unsupported(String),
 }
 
 /// High-level browser client that owns planning and runtime dispatch.
