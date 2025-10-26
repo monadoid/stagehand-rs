@@ -31,9 +31,10 @@ use crate::browser::{
 
 const DEFAULT_BROWSERBASE_API_URL: &str = "https://api.browserbase.com/v1";
 
-#[derive(Default)]
 pub struct ChromiumoxideRuntime {
     state: Arc<Mutex<Option<RuntimeState>>>,
+    remote_config: Arc<Mutex<Option<BrowserbaseRuntimeState>>>,
+    reconnect_lock: Arc<Mutex<()>>,
 }
 
 struct RuntimeState {
@@ -202,10 +203,80 @@ impl ChromiumoxideRuntime {
     pub fn new() -> Self {
         Self {
             state: Arc::new(Mutex::new(None)),
+            remote_config: Arc::new(Mutex::new(None)),
+            reconnect_lock: Arc::new(Mutex::new(())),
+        }
+    }
+    async fn store_remote_config(&self, remote: Option<BrowserbaseRuntimeState>) {
+        let mut guard = self.remote_config.lock().await;
+        *guard = remote;
+    }
+
+    async fn current_browser(&self) -> Option<Arc<Browser>> {
+        let guard = self.state.lock().await;
+        guard.as_ref().map(|state| state.browser.clone())
+    }
+
+    async fn ensure_browser_alive(&self) -> Result<(), BrowserRuntimeError> {
+        let (browser, remote_snapshot) = {
+            let guard = self.state.lock().await;
+            match guard.as_ref() {
+                Some(state) => (Some(state.browser.clone()), state.remote.clone()),
+                None => (None, None),
+            }
+        };
+
+        if let Some(browser) = browser {
+            match browser.version().await.map_err(map_chromiumoxide_error) {
+                Ok(_) => Ok(()),
+                Err(err) => {
+                    let mut remote = remote_snapshot;
+                    if remote.is_none() {
+                        remote = self.remote_config.lock().await.clone();
+                    }
+                    if let Some(remote_state) = remote {
+                        self.reconnect_remote(remote_state).await
+                    } else {
+                        Err(err)
+                    }
+                }
+            }
+        } else {
+            let remote = self.remote_config.lock().await.clone();
+            if let Some(remote_state) = remote {
+                self.reconnect_remote(remote_state).await
+            } else {
+                Err(BrowserRuntimeError::NotInitialized)
+            }
         }
     }
 
+    async fn reconnect_remote(
+        &self,
+        remote: BrowserbaseRuntimeState,
+    ) -> Result<(), BrowserRuntimeError> {
+        let _lock = self.reconnect_lock.lock().await;
+
+        if let Some(browser) = self.current_browser().await {
+            if browser
+                .version()
+                .await
+                .map_err(map_chromiumoxide_error)
+                .is_ok()
+            {
+                return Ok(());
+            }
+        }
+
+        attach_to_cdp(&self.state, &remote.connect_url).await?;
+        self.set_remote_state(remote.clone()).await?;
+        self.populate_initial_pages().await?;
+        self.ensure_target_monitor().await?;
+        Ok(())
+    }
+
     pub async fn page(&self, page_id: &str) -> Result<Option<ChromiumPage>, BrowserRuntimeError> {
+        self.ensure_browser_alive().await?;
         let guard = self.state.lock().await;
         let state = guard.as_ref().ok_or(BrowserRuntimeError::NotInitialized)?;
         Ok(state.pages.get(page_id).cloned())
@@ -346,16 +417,47 @@ impl ChromiumoxideRuntime {
         &self,
         remote: BrowserbaseRuntimeState,
     ) -> Result<(), BrowserRuntimeError> {
-        let mut guard = self.state.lock().await;
-        match guard.as_mut() {
-            Some(state) => {
-                state.remote = Some(remote);
-                Ok(())
+        {
+            let mut guard = self.state.lock().await;
+            match guard.as_mut() {
+                Some(state) => {
+                    state.remote = Some(remote.clone());
+                }
+                None => {
+                    return Err(BrowserRuntimeError::Message(
+                        "browser runtime not initialised after connection".into(),
+                    ));
+                }
             }
-            None => Err(BrowserRuntimeError::Message(
-                "browser runtime not initialised after connection".into(),
-            )),
         }
+
+        self.store_remote_config(Some(remote)).await;
+        Ok(())
+    }
+
+    pub async fn shutdown(&self) -> Result<(), BrowserRuntimeError> {
+        let state = {
+            let mut guard = self.state.lock().await;
+            guard.take()
+        };
+
+        if let Some(state) = state {
+            let temp_dir = cleanup_state(state);
+            if let Some(path) = temp_dir {
+                if let Err(err) = fs::remove_dir_all(&path).await {
+                    eprintln!("failed to remove temporary user data dir {:?}: {err}", path);
+                }
+            }
+        }
+
+        self.store_remote_config(None).await;
+        Ok(())
+    }
+}
+
+impl Default for ChromiumoxideRuntime {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -424,11 +526,13 @@ impl BrowserRuntime for ChromiumoxideRuntime {
 
         self.populate_initial_pages().await?;
         self.ensure_target_monitor().await?;
+        self.store_remote_config(None).await;
 
         Ok(())
     }
 
     async fn new_page(&self, url: &str) -> Result<String, BrowserRuntimeError> {
+        self.ensure_browser_alive().await?;
         let browser = {
             let guard = self.state.lock().await;
             let state = guard.as_ref().ok_or(BrowserRuntimeError::NotInitialized)?;
@@ -453,6 +557,7 @@ impl BrowserRuntime for ChromiumoxideRuntime {
     }
 
     async fn page_content(&self, page_id: &str) -> Result<Option<String>, BrowserRuntimeError> {
+        self.ensure_browser_alive().await?;
         let page = {
             let guard = self.state.lock().await;
             let state = guard.as_ref().ok_or(BrowserRuntimeError::NotInitialized)?;
@@ -468,6 +573,7 @@ impl BrowserRuntime for ChromiumoxideRuntime {
     }
 
     async fn list_pages(&self) -> Result<Vec<String>, BrowserRuntimeError> {
+        self.ensure_browser_alive().await?;
         let guard = self.state.lock().await;
         let state = guard.as_ref().ok_or(BrowserRuntimeError::NotInitialized)?;
         Ok(state.pages.keys().cloned().collect())
@@ -476,10 +582,21 @@ impl BrowserRuntime for ChromiumoxideRuntime {
     async fn target_event_stream(
         &self,
     ) -> Result<broadcast::Receiver<RuntimeTargetEvent>, BrowserRuntimeError> {
+        self.ensure_browser_alive().await?;
         self.ensure_target_monitor().await?;
         let guard = self.state.lock().await;
         let state = guard.as_ref().ok_or(BrowserRuntimeError::NotInitialized)?;
         Ok(state.target_events.subscribe())
+    }
+
+    async fn main_frame_id(&self, page_id: &str) -> Result<Option<String>, BrowserRuntimeError> {
+        let page = self.page(page_id).await?;
+        if let Some(page) = page {
+            let frame = page.mainframe().await.map_err(map_chromiumoxide_error)?;
+            Ok(frame.map(|id| id.as_ref().to_string()))
+        } else {
+            Ok(None)
+        }
     }
 }
 
@@ -509,6 +626,10 @@ impl BrowserRuntime for Arc<ChromiumoxideRuntime> {
         &self,
     ) -> Result<broadcast::Receiver<RuntimeTargetEvent>, BrowserRuntimeError> {
         (**self).target_event_stream().await
+    }
+
+    async fn main_frame_id(&self, page_id: &str) -> Result<Option<String>, BrowserRuntimeError> {
+        (**self).main_frame_id(page_id).await
     }
 }
 
@@ -583,8 +704,7 @@ async fn attach_to_cdp(
     let join = spawn_handler(handler);
     let (event_tx, _) = broadcast::channel(32);
 
-    let mut guard = state.lock().await;
-    *guard = Some(RuntimeState {
+    let new_state = RuntimeState {
         browser,
         _handler: join,
         pages: HashMap::new(),
@@ -593,7 +713,23 @@ async fn attach_to_cdp(
         temp_user_data_dir: None,
         target_listener: None,
         target_events: event_tx,
-    });
+    };
+
+    let old_state = {
+        let mut guard = state.lock().await;
+        let previous = guard.take();
+        *guard = Some(new_state);
+        previous
+    };
+
+    if let Some(state) = old_state {
+        let temp_dir = cleanup_state(state);
+        if let Some(path) = temp_dir {
+            if let Err(err) = fs::remove_dir_all(&path).await {
+                eprintln!("failed to remove temporary user data dir {:?}: {err}", path);
+            }
+        }
+    }
 
     Ok(())
 }
@@ -618,8 +754,7 @@ async fn launch_persistent(
     let join = spawn_handler(handler);
     let (event_tx, _) = broadcast::channel(32);
 
-    let mut guard = state.lock().await;
-    *guard = Some(RuntimeState {
+    let new_state = RuntimeState {
         browser,
         _handler: join,
         pages: HashMap::new(),
@@ -628,7 +763,23 @@ async fn launch_persistent(
         temp_user_data_dir: None,
         target_listener: None,
         target_events: event_tx,
-    });
+    };
+
+    let old_state = {
+        let mut guard = state.lock().await;
+        let previous = guard.take();
+        *guard = Some(new_state);
+        previous
+    };
+
+    if let Some(state) = old_state {
+        let temp_dir = cleanup_state(state);
+        if let Some(path) = temp_dir {
+            if let Err(err) = fs::remove_dir_all(&path).await {
+                eprintln!("failed to remove temporary user data dir {:?}: {err}", path);
+            }
+        }
+    }
 
     Ok(())
 }
@@ -641,6 +792,17 @@ fn spawn_handler(mut handler: chromiumoxide::handler::Handler) -> JoinHandle<()>
             }
         }
     })
+}
+
+fn cleanup_state(mut state: RuntimeState) -> Option<PathBuf> {
+    state._handler.abort();
+    if let Some(listener) = state.target_listener.take() {
+        listener.abort();
+    }
+    state.pages.clear();
+    state.session_targets.clear();
+    state.remote = None;
+    state.temp_user_data_dir.take()
 }
 
 #[cfg(test)]

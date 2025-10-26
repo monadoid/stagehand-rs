@@ -207,6 +207,12 @@ pub trait BrowserRuntime: Send + Sync {
             "target event stream not supported".to_string(),
         ))
     }
+
+    async fn main_frame_id(&self, _page_id: &str) -> Result<Option<String>, BrowserRuntimeError> {
+        Err(BrowserRuntimeError::Unsupported(
+            "main frame lookup not supported".to_string(),
+        ))
+    }
 }
 
 #[derive(Debug, Error)]

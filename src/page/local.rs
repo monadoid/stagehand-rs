@@ -632,6 +632,7 @@ fn coerce_extract_data(
 struct NavigationSnapshot {
     url: Option<String>,
     page_ids: HashSet<String>,
+    frame_ids: HashMap<String, String>,
 }
 
 async fn capture_navigation_snapshot(
@@ -655,9 +656,18 @@ async fn capture_navigation_snapshot(
         .into_iter()
         .collect::<HashSet<_>>();
 
+    let mut frame_ids = HashMap::new();
+    let page_id_list: Vec<String> = page_ids.iter().cloned().collect();
+    for page_id in page_id_list {
+        if let Some(frame_id) = page.client().runtime_main_frame_id_for(&page_id).await? {
+            frame_ids.insert(page_id, frame_id);
+        }
+    }
+
     Ok(NavigationSnapshot {
         url: current_url,
         page_ids,
+        frame_ids,
     })
 }
 
@@ -747,6 +757,29 @@ async fn handle_navigation_after_action(
                 Some("act"),
                 None,
             );
+        }
+    }
+
+    if let Some(previous) = before {
+        for (page_id, frame_id) in &after.frame_ids {
+            let needs_update = previous
+                .frame_ids
+                .get(page_id)
+                .map(|existing| existing != frame_id)
+                .unwrap_or(true);
+            if needs_update {
+                if let Err(err) = page
+                    .client()
+                    .ensure_frame_registered(page_id, Some(frame_id.clone()))
+                    .await
+                {
+                    logger.debug(
+                        format!("Failed to refresh frame id for {page_id}: {err}"),
+                        Some("act"),
+                        None,
+                    );
+                }
+            }
         }
     }
 }

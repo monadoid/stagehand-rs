@@ -2313,6 +2313,7 @@ dependencies = [
  "chromiumoxide",
  "chromiumoxide_types",
  "chrono",
+ "clap",
  "dotenvy",
  "env_logger",
  "futures-util",

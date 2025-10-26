@@ -359,6 +359,48 @@ impl<R: BrowserRuntime + 'static> StagehandClient<R> {
         Arc::clone(&self.metrics)
     }
 
+    pub(crate) async fn runtime_main_frame_id_for(
+        &self,
+        page_id: &str,
+    ) -> Result<Option<String>, StagehandClientError> {
+        match self.browser.runtime().main_frame_id(page_id).await {
+            Ok(frame) => Ok(frame),
+            Err(BrowserRuntimeError::Unsupported(_)) => Ok(None),
+            Err(BrowserRuntimeError::NotInitialized) => Ok(None),
+            Err(err) => Err(StagehandClientError::Browser(err)),
+        }
+    }
+
+    pub(crate) async fn ensure_frame_registered(
+        &self,
+        page_id: &str,
+        candidate: Option<String>,
+    ) -> Result<(), StagehandClientError> {
+        let frame_opt = match candidate {
+            Some(value) => Some(value),
+            None => self.runtime_main_frame_id_for(page_id).await?,
+        };
+
+        if let Some(frame_id) = frame_opt {
+            let page_id_owned = page_id.to_string();
+            let mut guard = self.context.lock().await;
+            if let Some(ctx) = guard.as_mut() {
+                if let Some(page) = ctx.page(&page_id_owned) {
+                    let needs_update = page
+                        .frame_id()
+                        .map(|existing| existing != frame_id)
+                        .unwrap_or(true);
+                    if needs_update {
+                        if let Err(err) = ctx.update_frame_id(&page_id_owned, frame_id.clone()) {
+                            return Err(StagehandClientError::Context(err));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub async fn fetch_replay_metrics(&self) -> Result<StagehandMetrics, StagehandClientError> {
         if !self.use_api() {
             return Ok(match self.metrics.lock() {
@@ -516,6 +558,8 @@ impl<R: BrowserRuntime + 'static> StagehandClient<R> {
             }
         }
 
+        let mut frame_updates = Vec::new();
+
         for page_id in &runtime_pages {
             if ctx.page(page_id).is_none() {
                 ctx.register_page(page_id.clone(), None);
@@ -527,6 +571,37 @@ impl<R: BrowserRuntime + 'static> StagehandClient<R> {
                             "context",
                         );
                     }
+                }
+                frame_updates.push(page_id.clone());
+            }
+        }
+
+        for page_id in frame_updates {
+            match self.runtime_main_frame_id_for(&page_id).await {
+                Ok(Some(frame_id)) => {
+                    if let Some(page) = ctx.page(&page_id) {
+                        let needs_update = page
+                            .frame_id()
+                            .map(|existing| existing != frame_id)
+                            .unwrap_or(true);
+                        if needs_update {
+                            if let Err(err) = ctx.update_frame_id(&page_id, frame_id.clone()) {
+                                self.log_debug(
+                                    &format!(
+                                        "Failed to update frame id mapping for {page_id}: {err}"
+                                    ),
+                                    "context",
+                                );
+                            }
+                        }
+                    }
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    self.log_debug(
+                        &format!("Skipping frame registration for {page_id}: {err}"),
+                        "context",
+                    );
                 }
             }
         }
@@ -574,34 +649,71 @@ impl<R: BrowserRuntime + 'static> StagehandClient<R> {
             return Ok(());
         }
 
-        let lock = self.page_switch_lock();
-        let _guard = lock.lock().await;
+        let frame_updates = {
+            let lock = self.page_switch_lock();
+            let _guard = lock.lock().await;
+            let mut frame_updates = Vec::new();
 
-        for event in pending {
-            match event {
-                RuntimeTargetEvent::Attached { target_id } => {
-                    ctx.register_page(target_id.clone(), None);
-                    ctx.ensure_dom_script(&target_id).await?;
-                    if let Err(err) = ctx.set_active_page(&target_id) {
-                        self.log_error(
-                            &format!("Failed to set active page to {target_id}: {err}"),
-                            "context",
-                        );
+            for event in pending {
+                match event {
+                    RuntimeTargetEvent::Attached { target_id } => {
+                        let page_id = target_id.clone();
+                        ctx.register_page(page_id.clone(), None);
+                        ctx.ensure_dom_script(&page_id).await?;
+                        if let Err(err) = ctx.set_active_page(&page_id) {
+                            self.log_error(
+                                &format!("Failed to set active page to {page_id}: {err}"),
+                                "context",
+                            );
+                        }
+                        frame_updates.push(target_id);
+                    }
+                    RuntimeTargetEvent::Detached { target_id } => {
+                        let was_removed = ctx.remove_page(&target_id);
+                        if was_removed && ctx.active_page_id().is_none() {
+                            let next_page = ctx.page_ids().next().cloned();
+                            if let Some(first) = next_page {
+                                if let Err(err) = ctx.set_active_page(&first) {
+                                    self.log_error(
+                                        &format!("Failed to set active page to {first}: {err}"),
+                                        "context",
+                                    );
+                                }
+                            }
+                        }
                     }
                 }
-                RuntimeTargetEvent::Detached { target_id } => {
-                    let was_removed = ctx.remove_page(&target_id);
-                    if was_removed && ctx.active_page_id().is_none() {
-                        let next_page = ctx.page_ids().next().cloned();
-                        if let Some(first) = next_page {
-                            if let Err(err) = ctx.set_active_page(&first) {
-                                self.log_error(
-                                    &format!("Failed to set active page to {first}: {err}"),
+            }
+
+            frame_updates
+        };
+
+        for page_id in frame_updates {
+            match self.runtime_main_frame_id_for(&page_id).await {
+                Ok(Some(frame_id)) => {
+                    if let Some(page) = ctx.page(&page_id) {
+                        let needs_update = page
+                            .frame_id()
+                            .map(|existing| existing != frame_id)
+                            .unwrap_or(true);
+                        if needs_update {
+                            if let Err(err) = ctx.update_frame_id(&page_id, frame_id.clone()) {
+                                self.log_debug(
+                                    &format!(
+                                        "Failed to update frame id mapping for {page_id}: {err}"
+                                    ),
                                     "context",
                                 );
                             }
                         }
                     }
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    self.log_debug(
+                        &format!("Skipping frame registration for {page_id}: {err}"),
+                        "context",
+                    );
                 }
             }
         }
@@ -617,15 +729,18 @@ impl<R: BrowserRuntime + 'static> StagehandClient<R> {
     ) -> Result<(), StagehandClientError> {
         let page_id = page_id.into();
         let frame_clone = frame_id.clone();
+        let page_id_for_context = page_id.clone();
         self.with_context(move |ctx| {
-            let page_id = page_id.clone();
+            let page_id = page_id_for_context.clone();
             Box::pin(async move {
                 ctx.register_page(page_id.clone(), frame_clone);
                 ctx.ensure_dom_script(&page_id).await?;
                 Ok(())
             })
         })
-        .await
+        .await?;
+
+        self.ensure_frame_registered(&page_id, frame_id).await
     }
 
     pub async fn set_active_page(&self, page_id: &str) -> Result<(), StagehandClientError> {
@@ -1265,6 +1380,13 @@ mod tests {
         async fn list_pages(&self) -> Result<Vec<String>, BrowserRuntimeError> {
             Ok(self.pages.lock().unwrap().keys().cloned().collect())
         }
+
+        async fn main_frame_id(
+            &self,
+            _page_id: &str,
+        ) -> Result<Option<String>, BrowserRuntimeError> {
+            Ok(None)
+        }
     }
 
     #[derive(Default)]
@@ -1436,7 +1558,15 @@ mod tests {
     async fn ensure_page_ready_initializes_browserbase_runtime_once() {
         let mut config = StagehandConfig::default();
         config.browserbase_session_id = Some("existing".into());
-        let runtime = RecordingRuntime::default();
+        let runtime = {
+            let runtime = RecordingRuntime::default();
+            runtime
+                .pages
+                .lock()
+                .unwrap()
+                .insert("page-1".to_string(), "content:existing".to_string());
+            runtime
+        };
         let adapter = Arc::new(RecordingAdapter::default());
         let http = Arc::new(MockHttpClient::new(vec![]));
         let client = StagehandClient::new_with_http_client(
@@ -1468,6 +1598,11 @@ mod tests {
     async fn remove_page_clears_context_state() {
         let config = StagehandConfig::default();
         let runtime = RecordingRuntime::default();
+        runtime
+            .pages
+            .lock()
+            .unwrap()
+            .insert("page-1".to_string(), "content:page-1".to_string());
         let adapter = Arc::new(RecordingAdapter::default());
         let http = Arc::new(MockHttpClient::new(vec![]));
         let client = StagehandClient::new_with_http_client(
@@ -1495,6 +1630,13 @@ mod tests {
             .unwrap();
 
         assert!(client.remove_page("page-1").await.unwrap());
+        client
+            .browser()
+            .runtime()
+            .pages
+            .lock()
+            .unwrap()
+            .remove("page-1");
         client
             .with_context(|ctx| {
                 Box::pin(async move {

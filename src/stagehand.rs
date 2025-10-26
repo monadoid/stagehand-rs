@@ -94,7 +94,6 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Mutex as StdMutex;
     use tokio::sync::Mutex;
-    use tokio::sync::Mutex;
 
     #[derive(Default)]
     struct MockRuntime {
@@ -138,6 +137,13 @@ mod tests {
             Err(BrowserRuntimeError::Unsupported(
                 "mock runtime does not support target events".into(),
             ))
+        }
+
+        async fn main_frame_id(
+            &self,
+            _page_id: &str,
+        ) -> Result<Option<String>, BrowserRuntimeError> {
+            Ok(None)
         }
     }
 
