@@ -8,6 +8,7 @@ use std::collections::HashSet;
 use std::io;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::Utc;
@@ -76,9 +77,25 @@ pub trait StagehandHttp: Send + Sync {
     ) -> Result<HttpResponse, StagehandClientError>;
 }
 
-#[derive(Default)]
 struct ReqwestStagehandHttpClient {
     client: HttpClient,
+}
+
+impl Default for ReqwestStagehandHttpClient {
+    fn default() -> Self {
+        // Match Python's 180-second per-operation timeouts to avoid hanging
+        // requests when the upstream API stalls.
+        let timeout = Duration::from_secs(180);
+        let client = HttpClient::builder()
+            .connect_timeout(timeout)
+            .timeout(timeout)
+            .pool_idle_timeout(timeout)
+            .build()
+            .unwrap_or_else(|err| {
+                panic!("failed to construct Stagehand HTTP client with timeouts: {err}")
+            });
+        Self { client }
+    }
 }
 
 #[async_trait]
@@ -341,6 +358,26 @@ impl<R: BrowserRuntime + 'static> StagehandClient<R> {
     pub fn log_error(&self, message: &str, category: &'static str) {
         self.logger.error(message, Some(category), None);
         self.adapter.log_error(message, category);
+    }
+
+    pub async fn shutdown(&self) -> Result<(), StagehandClientError> {
+        {
+            let mut guard = self.context.lock().await;
+            *guard = None;
+        }
+        {
+            let mut guard = self.target_events.lock().await;
+            *guard = None;
+        }
+        {
+            let mut guard = self.api_state.lock().await;
+            guard.session_id = None;
+        }
+
+        self.browser
+            .shutdown()
+            .await
+            .map_err(StagehandClientError::Browser)
     }
 
     pub fn llm_logger_callback(&self) -> LoggerCallback {

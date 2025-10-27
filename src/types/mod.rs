@@ -22,5 +22,6 @@ pub use llm::{
 };
 pub use page::{
     ActOptions, ActResult, DefaultExtractSchema, EmptyExtractSchema, ExtractOptions, ExtractResult,
-    MetadataSchema, ObserveElementSchema, ObserveInferenceSchema, ObserveOptions, ObserveResult,
+    MetadataSchema, NavigateOptions, ObserveElementSchema, ObserveInferenceSchema, ObserveOptions,
+    ObserveResult,
 };

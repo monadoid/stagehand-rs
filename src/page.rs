@@ -41,7 +41,8 @@ use crate::logging::StagehandLogger;
 use crate::metrics::StagehandFunctionName;
 use crate::runtime::ChromiumoxideRuntime;
 use crate::types::page::{
-    ActOptions, ActResult, ExtractOptions, ExtractResult, ObserveOptions, ObserveResult,
+    ActOptions, ActResult, ExtractOptions, ExtractResult, NavigateOptions, ObserveOptions,
+    ObserveResult,
 };
 
 mod local;
@@ -127,6 +128,14 @@ where
     }
 
     pub async fn goto(&self, url: &str) -> Result<(), StagehandClientError> {
+        self.goto_with_options(url, None).await
+    }
+
+    pub async fn goto_with_options(
+        &self,
+        url: &str,
+        options: Option<NavigateOptions>,
+    ) -> Result<(), StagehandClientError> {
         if !self.client.use_api() {
             if let Some(local_page) = self.as_chromiumoxide() {
                 return local_page.goto_local(url).await;
@@ -136,9 +145,32 @@ where
             ));
         }
 
-        Err(StagehandClientError::Unsupported(
-            "remote navigation not yet implemented",
-        ))
+        self.ensure_injection().await?;
+        let frame_id = self.frame_id().await?;
+
+        let mut payload = json!({ "url": url });
+
+        if let Some(frame_id) = frame_id {
+            if let Some(map) = payload.as_object_mut() {
+                map.insert("frameId".to_string(), JsonValue::String(frame_id));
+            }
+        }
+
+        if let Some(opts) = options {
+            let options_value = serde_json::to_value(opts)?;
+            if let JsonValue::Object(obj) = options_value {
+                if !obj.is_empty() {
+                    if let Some(map) = payload.as_object_mut() {
+                        map.insert("options".to_string(), JsonValue::Object(obj));
+                    }
+                }
+            }
+        }
+
+        // Ignore the returned navigation result for parity with the Python client,
+        // which simply ensures the request succeeds.
+        let _ = self.client.execute_api("navigate", payload).await?;
+        Ok(())
     }
 
     pub async fn observe(

@@ -531,6 +531,10 @@ impl BrowserRuntime for ChromiumoxideRuntime {
         Ok(())
     }
 
+    async fn shutdown(&self) -> Result<(), BrowserRuntimeError> {
+        ChromiumoxideRuntime::shutdown(self).await
+    }
+
     async fn new_page(&self, url: &str) -> Result<String, BrowserRuntimeError> {
         self.ensure_browser_alive().await?;
         let browser = {

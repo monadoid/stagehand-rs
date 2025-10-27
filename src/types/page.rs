@@ -119,3 +119,15 @@ pub struct ExtractResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data: Option<Value>,
 }
+
+/// Optional arguments accepted by Stagehand navigation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct NavigateOptions {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub referer: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wait_until: Option<String>,
+}

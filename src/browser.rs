@@ -194,6 +194,12 @@ pub trait BrowserRuntime: Send + Sync {
 
     async fn launch_local(&self, plan: &LocalPlan) -> Result<(), BrowserRuntimeError>;
 
+    async fn shutdown(&self) -> Result<(), BrowserRuntimeError> {
+        Err(BrowserRuntimeError::Unsupported(
+            "runtime shutdown not implemented".to_string(),
+        ))
+    }
+
     async fn new_page(&self, url: &str) -> Result<String, BrowserRuntimeError>;
 
     async fn page_content(&self, page_id: &str) -> Result<Option<String>, BrowserRuntimeError>;
@@ -500,7 +506,20 @@ fn string_from(map: &JsonObject, keys: &[&str]) -> Option<String> {
 }
 
 impl<R: BrowserRuntime> StagehandBrowser<R> {
-    pub fn new(config: StagehandConfig, runtime: R) -> Result<Self, BrowserError> {
+    pub fn new(mut config: StagehandConfig, runtime: R) -> Result<Self, BrowserError> {
+        if config.env == Environment::Local {
+            config.use_api = false;
+        } else if let Some(params) = config.browserbase_session_create_params() {
+            let should_disable = params
+                .get("region")
+                .and_then(JsonValue::as_str)
+                .map(|region| !region.eq_ignore_ascii_case("us-west-2"))
+                .unwrap_or(false);
+            if should_disable {
+                config.use_api = false;
+            }
+        }
+
         let manager = BrowserManager::new(config)?;
         Ok(Self { manager, runtime })
     }
@@ -526,6 +545,10 @@ impl<R: BrowserRuntime> StagehandBrowser<R> {
             BrowserPlan::Browserbase(plan) => self.runtime.connect_browserbase(&plan).await,
             BrowserPlan::Local(plan) => self.runtime.launch_local(&plan).await,
         }
+    }
+
+    pub async fn shutdown(&self) -> Result<(), BrowserRuntimeError> {
+        self.runtime.shutdown().await
     }
 }
 
@@ -646,6 +669,34 @@ mod tests {
             },
             _ => panic!("expected local plan"),
         }
+    }
+
+    #[test]
+    fn local_env_disables_use_api() {
+        let mut config = StagehandConfig::default();
+        config.env = Environment::Local;
+        config.use_api = true;
+
+        let runtime = RecordingRuntime::default();
+        let browser = StagehandBrowser::new(config, runtime).expect("browser");
+        assert!(!browser.config().use_api);
+    }
+
+    #[test]
+    fn non_us_west_region_disables_use_api() {
+        let mut config = StagehandConfig::default();
+        config.api_key = Some("key".into());
+        config.project_id = Some("proj".into());
+        let mut params = JsonObject::new();
+        params.insert(
+            "region".into(),
+            JsonValue::String("eu-central-1".to_string()),
+        );
+        config.browserbase_session_create_params = Some(params);
+
+        let runtime = RecordingRuntime::default();
+        let browser = StagehandBrowser::new(config, runtime).expect("browser");
+        assert!(!browser.config().use_api);
     }
 
     #[derive(Default)]

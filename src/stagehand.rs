@@ -11,6 +11,15 @@ use crate::client::{StagehandClient, StagehandClientError};
 use crate::config::StagehandConfig;
 use crate::page::StagehandPage;
 use crate::runtime::ChromiumoxideRuntime;
+use crate::types::page::{
+    ActOptions, ActResult, ExtractOptions, ExtractResult, NavigateOptions, ObserveOptions,
+    ObserveResult,
+};
+
+/// Lightweight helper mirroring the Python LivePage proxy.
+pub struct LivePage<'stagehand, R: BrowserRuntime> {
+    stagehand: &'stagehand Stagehand<R>,
+}
 
 /// Convenience error type surfaced by the [`Stagehand`] facade.
 #[derive(Debug, thiserror::Error)]
@@ -49,9 +58,19 @@ impl<R: BrowserRuntime + 'static> Stagehand<R> {
         &self.client
     }
 
+    /// Convenience helper to mirror Python's live page proxy.
+    pub fn live_page(&self) -> LivePage<'_, R> {
+        LivePage { stagehand: self }
+    }
+
     /// Ensure the underlying runtime (local or remote) has been initialised.
     pub async fn init(&self) -> Result<(), StagehandClientError> {
         self.client.ensure_initialized().await
+    }
+
+    /// Gracefully shut down the runtime and release resources.
+    pub async fn close(&self) -> Result<(), StagehandClientError> {
+        self.client.shutdown().await
     }
 
     /// Open a page, mark it active, and return a [`StagehandPage`] handle.
@@ -274,5 +293,51 @@ mod tests {
             Ok(_) => panic!("expected an error when no page is active"),
             Err(other) => panic!("unexpected error: {other}"),
         }
+    }
+}
+
+impl<'stagehand, R> LivePage<'stagehand, R>
+where
+    R: BrowserRuntime + 'static,
+{
+    async fn page(&self) -> Result<StagehandPage<'stagehand, R>, StagehandClientError> {
+        self.stagehand.page().await
+    }
+
+    pub async fn goto(&self, url: &str) -> Result<(), StagehandClientError> {
+        self.goto_with_options(url, None).await
+    }
+
+    pub async fn goto_with_options(
+        &self,
+        url: &str,
+        options: Option<NavigateOptions>,
+    ) -> Result<(), StagehandClientError> {
+        let page = self.page().await?;
+        match options {
+            Some(opts) => page.goto_with_options(url, Some(opts)).await,
+            None => page.goto(url).await,
+        }
+    }
+
+    pub async fn act(&self, options: ActOptions) -> Result<ActResult, StagehandClientError> {
+        let page = self.page().await?;
+        page.act(options).await
+    }
+
+    pub async fn observe(
+        &self,
+        options: ObserveOptions,
+    ) -> Result<Vec<ObserveResult>, StagehandClientError> {
+        let page = self.page().await?;
+        page.observe(options).await
+    }
+
+    pub async fn extract(
+        &self,
+        options: ExtractOptions,
+    ) -> Result<ExtractResult, StagehandClientError> {
+        let page = self.page().await?;
+        page.extract(options).await
     }
 }
